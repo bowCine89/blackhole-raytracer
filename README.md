@@ -118,6 +118,53 @@ With the defaults that means 9000 K near `r ≈ 3M` falling to about 3600 K at t
 outer edge — a factor ~150 in visible radiance, which is why the disk goes from
 white-hot to dull orange along its length.
 
+#### The outer edge
+
+A real thin disk has no outer edge. The dissipation profile falls off as `r⁻³`
+and the disk simply continues out to wherever it is fed, so a hard stop at
+`--rout` is a rendering convenience with no physics behind it — and it looks
+like one, as a knife-edge rim.
+
+What actually ends a disk observationally is its surface density dropping until
+it is no longer optically thick. The meaningful quantity is therefore optical
+depth, not a radius:
+
+```
+tau_perp(r) = min(tauMax, exp((rOut - r) / edgeWidth))
+```
+
+so `--rout` becomes the photosphere edge (where `tau_perp = 1`) rather than a
+wall, and `--edge` is the e-folding width of the decline. Transfer through the
+layer is the isothermal-slab solution
+
+```
+I_out = I_in e^-tau + B(T) (1 - e^-tau)
+```
+
+sampled by passing the photon through untouched with probability `e^-tau` and
+otherwise letting the layer emit. Two things then happen together, as they
+should: the rim **dims**, because a thin layer emits less than `sigma T^4`, and
+it becomes **transparent**, so stars and the disk's own far side show through
+it. As `tau -> infinity` this collapses exactly to the opaque disk.
+
+Because a ray crossing at a grazing angle passes through more material,
+`tau_eff = tau_perp / |mu|`, with `mu` the fluid-frame direction cosine against
+the disk normal. The rim therefore stays opaque longer where you skim it — real
+limb behaviour, and it comes for free.
+
+`--edge 0` restores the old hard-edged disk. The soft edge costs nothing: it is
+slightly *faster* (60 vs 64 integration steps per ray), because rays now
+terminate on the extended disk instead of integrating all the way out to the
+escape radius.
+
+The **inner** edge is left sharp, which is defensible: that is the ISCO, and the
+zero-torque boundary already drives the emissivity to zero there on its own.
+
+`--tau` caps the interior optical depth at 30 rather than the 10⁴–10⁶ a real
+disk carries. `exp(-30)` is `1e-13` — already perfectly opaque to within
+floating-point noise — so the cap is numerically indistinguishable from the true
+value while keeping the taper width interpretable.
+
 ### Radiative transfer
 
 The renderer is **spectral**, not RGB: each camera sample carries one
@@ -273,7 +320,7 @@ are coherent enough that lane divergence should stay low.
 ```
 Image     --width --height --spp --bounces --threads --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
-Disk      --rin --rout --tpeak --albedo --turbulence
+Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
 Sky       --sky-gain --star-density --band --nostars
 Tone map  --exposure --key --bloom --desat
 Accuracy  --rtol --max-steps
@@ -300,7 +347,14 @@ Some shots to try:
 ## What this does not model
 
 - The disk has **zero thickness**. There is no volumetric emission, no
-  optically thin corona, no jet.
+  optically thin corona, no jet. The outer edge does fade through an optical
+  depth rather than stopping dead, but it fades as an infinitely thin sheet
+  whose opacity drops, not as a flaring three-dimensional flow — a real disk
+  thickens with radius as `H/r` grows.
+- The outer taper is the **right form for the wrong reason**: surface density in
+  a real disk is set by the accretion rate and viscosity, whereas `--edge` is a
+  free parameter. The transfer through it is correct; where the disk chooses to
+  end is a knob.
 - `--turbulence` is **cosmetic** mottling, not a fluid simulation. Set it to `0`
   for the pure Novikov–Thorne profile. Everything else in the disk model is
   physical.

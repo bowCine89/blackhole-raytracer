@@ -48,6 +48,8 @@ struct Config {
     Real  tPeak = 9000.0;            // K
     Real  albedo = 0.20;
     Real  turbulence = 0.15;
+    Real  edgeWidth = 1.2;           // optical-depth e-folding width at rout
+    Real  tauMax = 30.0;
 
     Real  skyGain = 0.20;
     Real  starDensity = 0.16;
@@ -205,7 +207,12 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
     // the scattering block.
     Real throughput = 1;
 
-    for (int bounce = 0; ; ++bounce) {
+    // A transparent outer disk can be crossed several times by a single
+    // strongly lensed ray; this only bounds pathological cases.
+    constexpr int MAX_CROSSINGS = 32;
+    int bounce = 0, crossings = 0;
+
+    for (;;) {
         State yEnd;
         Term t = prop.run(g, yEnd, steps);
 
@@ -231,6 +238,33 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
         Real om  = disk.orbitOmega(r);
         Real nu  = u[0] * (g.E - om * g.L);          // -p.u in the fluid frame
         if (!(nu > 0)) break;
+
+        if (++crossings > MAX_CROSSINGS) break;
+
+        // Radiative transfer through the layer.  For an isothermal slab,
+        //     I_out = I_in e^-tau + B(T) (1 - e^-tau),
+        // so with probability e^-tau the photon passes through untouched and
+        // otherwise the layer emits its blackbody.  Sampling it this way is
+        // unbiased and collapses to the old opaque disk as tau -> infinity.
+        //
+        // e_2 is exactly d/dtheta normalised, so the fluid-frame direction
+        // cosine against the disk normal is just p_theta / (r nu).  A ray that
+        // skims the disk crosses more material: tau_eff = tau_perp / |mu|.
+        Real mu = clampf(std::fabs(pth) / (r * nu), 1e-4, 1.0);
+        Real trans = std::exp(-disk.opticalDepth(r) / mu);
+
+        if (trans > 0 && rng.uniform() < trans) {
+            // Passes through.  Same photon, same momentum, so `shift` is
+            // untouched -- only nudge past the plane so the crossing search
+            // does not re-fire on the point we just left.
+            g.r   = r;
+            g.th  = HALF_PI + (pth > 0 ? 1e-11 : -1e-11);
+            g.ph  = ph;
+            g.pr  = yEnd.y[3];
+            g.pth = pth;
+            continue;
+        }
+
         shift *= nu;
 
         Real gs = 1 / shift;
@@ -238,7 +272,7 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
         Real T = disk.temperature(r, ph);
         if (T > 0) radiance += throughput * gs5 * spec::planck(lambda0 * gs, T);
 
-        if (bounce >= maxBounces) break;
+        if (bounce++ >= maxBounces) break;
         // Russian roulette on the grey albedo: survivors keep unit weight.
         if (rng.uniform() >= disk.albedo) break;
 
@@ -612,6 +646,8 @@ int main(int argc, char** argv) {
         else if (s == "--tpeak")       c.tPeak = needF(i);
         else if (s == "--albedo")      c.albedo = needF(i);
         else if (s == "--turbulence")  c.turbulence = needF(i);
+        else if (s == "--edge")        c.edgeWidth = needF(i);
+        else if (s == "--tau")         c.tauMax = needF(i);
         else if (s == "--sky-gain")    c.skyGain = needF(i);
         else if (s == "--star-density")c.starDensity = needF(i);
         else if (s == "--band")        c.bandGain = needF(i);
@@ -638,6 +674,8 @@ int main(int argc, char** argv) {
     disk.tPeak = c.tPeak;
     disk.albedo = clampf(c.albedo, 0, 0.95);
     disk.turbulence = c.turbulence;
+    disk.edgeWidth = std::max<Real>(0, c.edgeWidth);
+    disk.tauMax = std::max<Real>(1e-3, c.tauMax);
     disk.noiseSeed = uint32_t(c.seed * 2654435761u + 17u);
     disk.init(kerr, c.diskIn, c.diskOut);
 
@@ -676,6 +714,9 @@ int main(int argc, char** argv) {
                     c.camR, c.camIncDeg, c.fovDeg);
         std::printf("  disk              %.3f M -> %.1f M, T_peak %.0f K, albedo %.2f\n",
                     disk.rIn, disk.rOut, disk.tPeak, disk.albedo);
+        if (disk.edgeWidth > 0)
+            std::printf("  outer edge        opaque to %.1f M, tau=1 at %.1f M, transparent by %.1f M\n",
+                        disk.rOut - disk.edgeWidth * std::log(disk.tauMax), disk.rOut, disk.rCut);
         std::printf("  image             %d x %d, %d spp, %d bounce%s, %d threads\n",
                     c.width, c.height, c.spp, c.maxBounces, c.maxBounces == 1 ? "" : "s", nThreads);
         std::fflush(stdout);

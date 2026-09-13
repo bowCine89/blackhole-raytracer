@@ -52,6 +52,29 @@ struct Disk {
     Real   turbulence = 0.15;    // cosmetic temperature mottling, 0 disables
     uint32_t noiseSeed = 12345;
 
+    // --- outer edge ---------------------------------------------------------
+    //
+    // A real thin disk has no outer edge: the dissipation profile falls off as
+    // r^-3 and the disk simply continues out to wherever it is fed.  What ends
+    // it observationally is the surface density dropping until the disk is no
+    // longer optically thick, at which point it both dims and becomes
+    // transparent.  The physically meaningful quantity is therefore the
+    // vertical optical depth, not a radius.
+    //
+    //     tau_perp(r) = min(tauMax, exp((rOut - r) / edgeWidth))
+    //
+    // so rOut is the photosphere edge (tau_perp = 1) rather than a hard stop,
+    // and edgeWidth is the e-folding length of the decline.  Setting
+    // edgeWidth = 0 restores the old hard-edged disk exactly.
+    Real   edgeWidth = 1.2;      // e-folding width of the optical-depth decline
+    Real   tauMax = 30.0;        // interior optical depth (see note below)
+    Real   rCut = 22;            // radius beyond which tau is negligible
+
+    // tauMax is capped at 30 rather than the 1e4-1e6 a real disk carries.
+    // exp(-30) is 1e-13: already perfectly opaque to within floating-point
+    // noise, so the cap is numerically indistinguishable from the real value
+    // while keeping the taper width interpretable.
+
     // Page-Thorne auxiliaries
     Real x0 = 0, x1 = 0, x2 = 0, x3 = 0, aStar = 0;
     Real fluxNorm = 1;           // 1 / max flux, so the profile peaks at 1
@@ -84,9 +107,21 @@ struct Disk {
             fmax = std::max(fmax, rawFlux(r));
         }
         fluxNorm = fmax > 0 ? 1 / fmax : 1;
+
+        // Stop tracking the disk once it transmits all but a fraction of a
+        // percent; beyond that it is indistinguishable from empty space.
+        rCut = (edgeWidth > 0) ? rOut + edgeWidth * std::log(200.0) : rOut;
     }
 
-    bool contains(Real r) const { return r >= rIn && r <= rOut; }
+    // Geometric extent the integrator has to consider.
+    bool contains(Real r) const { return r >= rIn && r <= rCut; }
+
+    // Vertical (face-on) optical depth of the disk at radius r.
+    Real opticalDepth(Real r) const {
+        if (r < rIn || r > rCut) return 0;
+        if (edgeWidth <= 0) return tauMax;
+        return std::min(tauMax, std::exp((rOut - r) / edgeWidth));
+    }
 
     // Page & Thorne (1974) eq. (15n): energy flux radiated per unit proper
     // area, up to a constant (Mdot, M) prefactor that the normalisation eats.
