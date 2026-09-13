@@ -111,6 +111,9 @@ struct Shared {
     std::atomic<double>   exposure{1.0};
     std::atomic<uint32_t> minCount{0};      // samples per pixel, for the title
     double meterCovered = 0, meterAnchor = 0, meterTarget = 0;
+
+    // Observer coordinate time, in M.  Mutated only under the pause barrier.
+    Real tObs = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -196,7 +199,7 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
 
             Real rad[LANES];
             tracePacket(sc.kerr, sc.disk, sc.sky, sc.prop, gp, lam, rgs,
-                        sc.maxBounces, n, rad);
+                        sc.maxBounces, n, rad, S.tObs);
             traced += uint64_t(n);
 
             for (int j = 0; j < n; ++j) shade(idxs[j], x + j, y, lam[j], rad[j]);
@@ -398,6 +401,11 @@ int main(int argc, char** argv) {
     int  winW = 1280, winH = 720;
     Real diskIn = -1, diskOut = 18.0;
     Real targetFps = 30.0;
+    // Coordinate time advanced per second of wall clock.  The ISCO orbital
+    // period at the default spin is about 24 M, so 6 M/s puts one inner orbit
+    // at roughly four seconds: fast enough to read, slow enough to follow.
+    double timeScale = 6.0;
+    bool   playing = true;
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     double userExposure = 1.0, key = 1.3;
@@ -424,6 +432,8 @@ int main(int argc, char** argv) {
         else if (a == "--nostars")    sc.sky.enabled = false;
         else if (a == "--exposure")   userExposure = nextF();
         else if (a == "--fps")        targetFps = nextF();
+        else if (a == "--timescale")  timeScale = nextF();
+        else if (a == "--paused")     playing = false;
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
         else if (a == "--autoorbit")  autoOrbit = true;
@@ -520,6 +530,17 @@ int main(int argc, char** argv) {
 
         bool camChanged = false;
 
+        // Advancing the disk invalidates the accumulated image exactly as a
+        // camera move does, so it goes through the same reset path.  That also
+        // means an animating disk never settles -- which is not a limitation
+        // but arithmetic: a changing scene has nothing to accumulate.  Pause
+        // with space to let it converge.
+        if (playing) {
+            double dtWall = std::min(0.1, since(lastFrame));   // clamp a hitch
+            S.tObs += dtWall * timeScale;
+            camChanged = true;
+        }
+
         // Scripted motion, so the interactive path can be exercised headlessly.
         if (autoOrbit && since(startTime) < autoQuit * 0.6) {
             S.cam.phiDeg += 1.5;
@@ -593,6 +614,27 @@ int main(int argc, char** argv) {
                 switch (e.key.keysym.sym) {
                 case SDLK_ESCAPE: case SDLK_q: running = false; break;
                 case SDLK_r: S.cam = home; camChanged = true; break;
+                case SDLK_SPACE:
+                    playing = !playing;
+                    std::printf("  %s  (t = %.1f M)\n", playing ? "playing" : "paused", double(S.tObs));
+                    std::fflush(stdout);
+                    lastInput = Clock::now();
+                    break;
+                case SDLK_t:
+                    reconfigure(S, [&] { S.tObs = 0; resetAccumulation(S); });
+                    std::printf("  time reset to 0\n");
+                    std::fflush(stdout);
+                    break;
+                case SDLK_k:
+                    timeScale = std::max(0.05, timeScale / 1.5);
+                    std::printf("  time scale = %.2f M per second\n", timeScale);
+                    std::fflush(stdout);
+                    break;
+                case SDLK_l:
+                    timeScale = std::min(2000.0, timeScale * 1.5);
+                    std::printf("  time scale = %.2f M per second\n", timeScale);
+                    std::fflush(stdout);
+                    break;
                 case SDLK_LEFTBRACKET:
                 case SDLK_RIGHTBRACKET: {
                     Real d = (e.key.keysym.sym == SDLK_RIGHTBRACKET) ? 0.02 : -0.02;
@@ -653,7 +695,7 @@ int main(int argc, char** argv) {
         if (camChanged) lastInput = Clock::now();
 
         // --- choose the regime -------------------------------------------
-        bool moving = since(lastInput) < 0.25;
+        bool moving = since(lastInput) < 0.25 || playing;
         int desiredScale;
         if (moving) {
             // Pick the coarsest-to-finest scale that still fits one sample per

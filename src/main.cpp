@@ -74,6 +74,7 @@ struct Config {
     bool  stats = false;
     bool  quiet = false;
     bool  simd = true;               // 8-wide packet tracing; --no-simd disables
+    Real  tObs = 0.0;                // observer coordinate time, in M
 };
 
 // ---------------------------------------------------------------------------
@@ -289,6 +290,70 @@ static int runChecks() {
                     "Page-Thorne flux vanishes at the ISCO", "", zeroTorque ? "ok" : "FAIL");
     }
 
+    // --- coordinate time along a ray (Shapiro delay) ------------------------
+    // The geodesic now carries t so that the emission time at a disk hit is
+    // known.  For a radial null ray in Schwarzschild, dt/dr = 1/(1 - 2M/r), so
+    //     dt = (r2 - r1) + 2M ln((r2 - 2M)/(r1 - 2M)),
+    // the excess over the flat-space r2 - r1 being the Shapiro delay.  That is
+    // an exact closed form to check the new equation against.
+    {
+        Kerr k(1e-9);
+        Disk none; none.rIn = 1e30; none.rOut = -1e30; none.rCut = -1e30;
+        Propagator prop;
+        prop.kerr = &k; prop.disk = &none;
+        prop.rEscape = 1000;
+        prop.rCapture = std::max(k.horizon() * 1.0005, k.photonOrbit(true));
+        prop.rtol = 1e-12; prop.maxSteps = 400000; prop.diskActive = false;
+
+        Real r0 = 20.0;
+        Real D = k.delta(r0);
+        Geodesic g;
+        g.r = r0; g.th = PI / 2; g.ph = 0; g.E = 1; g.L = 0; g.pth = 0;
+        g.pr = (r0 * r0) / D;                       // outgoing radial null ray
+        State y;
+        Term t = prop.run(g, y);
+        Real rEnd = y.y[0], got = y.y[5];
+        Real want = (rEnd - r0) + 2.0 * std::log((rEnd - 2.0) / (r0 - 2.0));
+        bool ok = (t == Term::Escaped) &&
+                  std::fabs(got - want) / want < 1e-9;
+        if (!ok) ++failures;
+        std::printf("  %-46s %14.6f  expected %14.6f  relerr %.2e  %s\n",
+                    "light travel time, radial ray r=20 to 1000",
+                    got, want, std::fabs(got - want) / want, ok ? "ok" : "FAIL");
+    }
+
+    // --- the disk pattern orbits at the Keplerian rate ----------------------
+    // A ring at radius r must return to exactly its starting state after one
+    // orbital period 2 pi / Omega(r), and must not look the same half a period
+    // in.  Period closure is what pins the *rate*: advecting at any other
+    // angular velocity would leave the pattern somewhere else after 2 pi/Omega.
+    {
+        Kerr k(0.94);
+        Disk d;
+        d.turbulence = 0.15;
+        d.init(k, -1, 18.0);
+
+        Real worstClosure = 0, leastChange = 1e30;
+        for (Real r : {2.5, 4.0, 6.0, 10.0, 16.0}) {
+            Real period = TWO_PI / d.orbitOmega(r);
+            for (Real phi : {0.0, 1.1, 2.7, 4.9}) {
+                Real t0 = d.temperature(r, phi, 0.0);
+                Real t1 = d.temperature(r, phi, period);          // one full orbit
+                Real th = d.temperature(r, phi, period * 0.5);    // half an orbit
+                worstClosure = std::max(worstClosure, std::fabs(t1 - t0) / std::max<Real>(t0, 1e-9));
+                leastChange  = std::min(leastChange,  std::fabs(th - t0) / std::max<Real>(t0, 1e-9));
+            }
+        }
+        bool ok = worstClosure < 1e-9 && leastChange > 1e-3;
+        if (!ok) ++failures;
+        std::printf("  %-46s %14.3e  (tolerance %9.1e)              %s\n",
+                    "disk pattern closes after one orbital period", worstClosure, 1e-9,
+                    worstClosure < 1e-9 ? "ok" : "FAIL");
+        std::printf("  %-46s %14.3e  (must exceed %9.1e)           %s\n",
+                    "...and differs at half a period", leastChange, 1e-3,
+                    leastChange > 1e-3 ? "ok" : "FAIL");
+    }
+
     // --- SIMD layer ---------------------------------------------------------
     // The packet tracer replaces libm sin/cos with its own vector version, so
     // that has to be held to libm before anything built on it can be trusted.
@@ -485,6 +550,7 @@ int main(int argc, char** argv) {
         else if (s == "--stats")       c.stats = true;
         else if (s == "--simd")        c.simd = true;
         else if (s == "--no-simd")     c.simd = false;
+        else if (s == "--time")        c.tObs = needF(i);
         else if (s == "--help" || s == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", s.c_str()); usage(); return 2; }
     }
@@ -610,7 +676,7 @@ int main(int argc, char** argv) {
                             }
                             Real rad[LANES];
                             tracePacket(kerr, disk, sky, prop, gp, lam, rgs,
-                                        c.maxBounces, n, rad, &localSteps);
+                                        c.maxBounces, n, rad, c.tObs, &localSteps);
                             for (int j = 0; j < n; ++j)
                                 if (rad[j] > 0) xyz += spec::cieXYZ(lam[j]) * rad[j];
                             localRays += uint64_t(n);
@@ -620,7 +686,7 @@ int main(int argc, char** argv) {
                             Real lambda, sx, sy;
                             sampleOf(s, lambda, sx, sy);
                             Geodesic g = cam.ray(sx, sy);
-                            Real L = tracePath(kerr, disk, sky, prop, g, lambda, rng, c.maxBounces, &localSteps);
+                            Real L = tracePath(kerr, disk, sky, prop, g, lambda, rng, c.maxBounces, c.tObs, &localSteps);
                             if (L > 0) xyz += spec::cieXYZ(lambda) * L;
                             ++localRays;
                         }

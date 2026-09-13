@@ -75,7 +75,15 @@ struct Geodesic {
 };
 
 // The five-component state the integrator advances.
-struct State { Real y[5]; };       // r, theta, phi, p_r, p_theta
+// Six components: r, theta, phi, p_r, p_theta, t.
+//
+// Coordinate time rides along so that the *emission time* at a disk hit is
+// known.  Light from the far side of the disk, and from the lensed images that
+// loop around the hole, left earlier than light from the near side -- tens of M
+// earlier, against an ISCO orbital period of ~24 M -- so without it an animated
+// disk would show every part of itself at the same instant, which is wrong.
+static constexpr int NSTATE = 6;
+struct State { Real y[NSTATE]; };
 
 // Everything about a ray that is fixed along its whole trajectory.  Hoisting
 // these out of the right-hand side matters: the RHS runs six times per
@@ -116,6 +124,8 @@ inline void geodesicRhs(const RayConst& c, const State& s, State& out) {
     Real invD  = 1 / D;
     Real PinvD = (c.E * (r2 + c.a2) - c.aL) * invD;
 
+    Real s2 = sth * sth;
+
     out.y[0] = D * pr;                                          // dr/dtau
     out.y[1] = pth;                                             // dtheta/dtau
     out.y[2] = c.L * invS2 - c.aE + c.a * PinvD;                // dphi/dtau
@@ -123,6 +133,8 @@ inline void geodesicRhs(const RayConst& c, const State& s, State& out) {
     out.y[3] = -0.5 * (dD * pr * pr - 4 * r * c.E * PinvD + PinvD * PinvD * dD);
     // dp_theta/dtau = -1/2 dF/dtheta
     out.y[4] = cth * (c.L2 * invS2 * invS - c.a2E2 * sth);
+    // dt/dtau = -1/2 dF/dE, the same Hamiltonian, differentiated by energy.
+    out.y[5] = c.a * (c.L - c.aE * s2) + (r2 + c.a2) * PinvD;
 }
 
 // Value of the null constraint F.  Zero analytically; its drift is a direct
@@ -163,28 +175,28 @@ struct DormandPrince {
             e5  = -17253.0 / 339200, e6 = 22.0 / 525,    e7 = -1.0 / 40;
 
         State t, k2;
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * a21 * k1.y[i];
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * a21 * k1.y[i];
         geodesicRhs(rc, t, k2);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (a31 * k1.y[i] + a32 * k2.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (a31 * k1.y[i] + a32 * k2.y[i]);
         geodesicRhs(rc, t, k3);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (a41 * k1.y[i] + a42 * k2.y[i] + a43 * k3.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (a41 * k1.y[i] + a42 * k2.y[i] + a43 * k3.y[i]);
         geodesicRhs(rc, t, k4);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (a51 * k1.y[i] + a52 * k2.y[i] + a53 * k3.y[i] + a54 * k4.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (a51 * k1.y[i] + a52 * k2.y[i] + a53 * k3.y[i] + a54 * k4.y[i]);
         geodesicRhs(rc, t, k5);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (a61 * k1.y[i] + a62 * k2.y[i] + a63 * k3.y[i] + a64 * k4.y[i] + a65 * k5.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (a61 * k1.y[i] + a62 * k2.y[i] + a63 * k3.y[i] + a64 * k4.y[i] + a65 * k5.y[i]);
         geodesicRhs(rc, t, k6);
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < NSTATE; ++i)
             yOut.y[i] = y.y[i] + h * (b1 * k1.y[i] + b3 * k3.y[i] + b4 * k4.y[i] + b5 * k5.y[i] + b6 * k6.y[i]);
         geodesicRhs(rc, yOut, k7);      // FSAL: k1 of the next step
 
         Real err = 0;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < NSTATE; ++i) {
             Real e  = h * (e1 * k1.y[i] + e3 * k3.y[i] + e4 * k4.y[i] + e5 * k5.y[i] + e6 * k6.y[i] + e7 * k7.y[i]);
             Real sc = atol + rtol * std::max(std::fabs(y.y[i]), std::fabs(yOut.y[i]));
             Real q  = e / sc;
             err += q * q;
         }
-        return std::sqrt(err / 5);
+        return std::sqrt(err / NSTATE);
     }
 
     // Dense-output coefficients for a step that was just accepted.
@@ -193,7 +205,7 @@ struct DormandPrince {
             d1 = -12715105075.0 / 11282082432.0, d3 = 87487479700.0 / 32700410799.0,
             d4 = -10690763975.0 / 1880347072.0,  d5 = 701980252875.0 / 199316789632.0,
             d6 = -1453857185.0 / 822651844.0,    d7 = 69997945.0 / 29380423.0;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < NSTATE; ++i) {
             c1.y[i] = y0.y[i];
             c2.y[i] = y1.y[i] - y0.y[i];
             c3.y[i] = h * k1.y[i] - c2.y[i];
@@ -206,7 +218,7 @@ struct DormandPrince {
     // Evaluate the interpolant at s in [0,1] across the last accepted step.
     void interpolate(Real s, State& out) const {
         Real s1 = 1 - s;
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < NSTATE; ++i)
             out.y[i] = c1.y[i] + s * (c2.y[i] + s1 * (c3.y[i] + s * (c4.y[i] + s1 * c5.y[i])));
     }
 

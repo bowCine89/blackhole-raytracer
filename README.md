@@ -87,6 +87,8 @@ refining for as long as you leave it alone.
 left drag     orbit (inclination and azimuth)      [ / ]   spin a/M
 right drag    pan the aim point                    , / .   disk outer radius
 wheel         dolly in/out                         - / =   exposure
+space         play / pause disk rotation           k / l   time scale
+t             reset time to zero
 ctrl+wheel    field of view                        b       scattering bounces
 r             reset camera                         s       save a PNG
                                                    esc/q   quit
@@ -373,6 +375,66 @@ speed and the other recedes.
 **Assumes:** no radial drift and no pressure support. Valid outside the ISCO;
 inside it the flow plunges and this model does not apply, which is exactly where
 the disk is truncated.
+
+#### Rotation, and why it needs coordinate time
+
+The disk turns at this Keplerian rate, and the geodesic carries
+Boyer–Lindquist coordinate time so that it turns *correctly*.
+
+Start with what is **not** visible. A Novikov–Thorne disk is stationary and
+axisymmetric: its temperature depends on $r$ alone, so it looks identical at
+every instant, and the Doppler beaming pattern is fixed in place. An
+axisymmetric disk rotating is, by construction, invisible. What you see turning
+is the non-axisymmetric structure, which here is the `--turbulence` mottling —
+so with `--turbulence 0` the disk is *correctly* motionless.
+
+That structure is advected with the gas. A fluid element at azimuth $\phi_0$
+sits at $\phi = \phi_0 + \Omega(r)\mkern3mu t$, so the pattern is sampled at
+$\phi - \Omega(r)\mkern3mu t$, using the same $\Omega$ that already sets the
+Doppler shift. Because $\Omega$ falls off with radius the disk shears: at
+$a = 0.94$ the ISCO orbit takes about **24 M** while $r = 16M$ takes **420 M**,
+so the inner disk laps the outer some seventeen times. That differential
+winding is the visible effect.
+
+| $t = 0$ | $t = 16M$, two thirds of an ISCO orbit |
+|---|---|
+| ![t=0](out/rotation-t0.png) | ![t=16](out/rotation-t16.png) |
+
+**Coordinate time is the part that takes real work.** Light from the far side of
+the disk, and from the lensed images that loop around the hole, left *earlier*
+than light from the near side — by tens of $M$, against a 24 $M$ inner orbital
+period. Without tracking it every part of the image would show the disk at one
+instant, which is simply wrong. So the integrator carries $t$ as a sixth state
+component, from the same Hamiltonian differentiated by energy:
+
+$$
+\frac{dt}{d\tau} = -\frac{1}{2}\frac{\partial F}{\partial E}
+= a\left(L - aE\sin^2\theta\right) + \left(r^2 + a^2\right)\frac{P}{\Delta}
+$$
+
+and a disk hit is dated $t_{\rm obs} - \Delta t$. It costs about 5% (60 → 83
+integration steps per ray, since $t$ now participates in the error norm).
+
+That equation is checked against a closed form in `--check`: for a radial ray in
+Schwarzschild $dt/dr = (1 - 2M/r)^{-1}$ integrates to
+$\Delta t = (r_2 - r_1) + 2M\ln\frac{r_2 - 2M}{r_1 - 2M}$, the excess over
+$r_2 - r_1$ being the Shapiro delay. It matches to **1.3e-15**. A second test
+pins the *rate*: a ring must return to exactly its starting state after one
+period $2\pi/\Omega(r)$ — it closes to **6e-16** — and must differ half a period
+in, which it does.
+
+**On "the right speed" in wall-clock terms.** There isn't one: it depends
+entirely on the mass. $24M$ at the ISCO is 1.2 ms for a 10 $M_\odot$ hole, about
+8 minutes for Sgr A\*, and roughly 9 days for M87\*. What physics fixes is the
+*ratio* of rates between radii, which is what the code gets right; the absolute
+rate is a playback choice. `--timescale` in the viewer sets how much coordinate
+time passes per second of wall clock, defaulting to 6 M/s so one inner orbit
+takes about four seconds. `--time T` renders a single instant, so a sequence is
+just a loop:
+
+```powershell
+0..119 | % { .\kerr.exe --quiet --time ($_ * 0.4) --out ("frame{0:d3}.png" -f $_) }
+```
 
 ### 5. Emission and relativistic transfer
 
@@ -695,7 +757,7 @@ compaction is paid for.
 ```
 Image     --width --height --spp --bounces --threads --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
-Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
+Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau --time
 Sky       --sky-gain --star-density --band --nostars
 Tone map  --exposure --key --bloom --desat
 Accuracy  --rtol --max-steps --no-simd

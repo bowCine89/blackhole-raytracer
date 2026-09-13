@@ -19,7 +19,7 @@
 #include "simd.hpp"
 #include "render.hpp"
 
-struct PacketState { vd y[5]; };           // r, theta, phi, p_r, p_theta
+struct PacketState { vd y[NSTATE]; };      // r, theta, phi, p_r, p_theta, t
 
 // Per-lane ray constants, the vector twin of RayConst.
 struct PacketConst {
@@ -60,11 +60,14 @@ static inline void geodesicRhsV(const PacketConst& c, const PacketState& s, Pack
     vd invD  = vsplat(1.0) / D;
     vd PinvD = (c.E * (r2 + c.a2) - c.aL) * invD;
 
+    vd s2 = sth * sth;
+
     out.y[0] = D * pr;
     out.y[1] = pth;
     out.y[2] = c.L * invS2 - c.aE + c.a * PinvD;
     out.y[3] = vsplat(-0.5) * (dD * pr * pr - vsplat(4.0) * r * c.E * PinvD + PinvD * PinvD * dD);
     out.y[4] = cth * (c.L2 * invS2 * invS - c.a2E2 * sth);
+    out.y[5] = c.a * (c.L - c.aE * s2) + (r2 + c.a2) * PinvD;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,29 +92,29 @@ struct PacketDP {
             e5  = -17253.0 / 339200, e6 = 22.0 / 525,    e7 = -1.0 / 40;
 
         PacketState t, k2;
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (vsplat(a21) * k1.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (vsplat(a21) * k1.y[i]);
         geodesicRhsV(rc, t, k2);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (vsplat(a31) * k1.y[i] + vsplat(a32) * k2.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (vsplat(a31) * k1.y[i] + vsplat(a32) * k2.y[i]);
         geodesicRhsV(rc, t, k3);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (vsplat(a41) * k1.y[i] + vsplat(a42) * k2.y[i] + vsplat(a43) * k3.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (vsplat(a41) * k1.y[i] + vsplat(a42) * k2.y[i] + vsplat(a43) * k3.y[i]);
         geodesicRhsV(rc, t, k4);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (vsplat(a51) * k1.y[i] + vsplat(a52) * k2.y[i] + vsplat(a53) * k3.y[i] + vsplat(a54) * k4.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (vsplat(a51) * k1.y[i] + vsplat(a52) * k2.y[i] + vsplat(a53) * k3.y[i] + vsplat(a54) * k4.y[i]);
         geodesicRhsV(rc, t, k5);
-        for (int i = 0; i < 5; ++i) t.y[i] = y.y[i] + h * (vsplat(a61) * k1.y[i] + vsplat(a62) * k2.y[i] + vsplat(a63) * k3.y[i] + vsplat(a64) * k4.y[i] + vsplat(a65) * k5.y[i]);
+        for (int i = 0; i < NSTATE; ++i) t.y[i] = y.y[i] + h * (vsplat(a61) * k1.y[i] + vsplat(a62) * k2.y[i] + vsplat(a63) * k3.y[i] + vsplat(a64) * k4.y[i] + vsplat(a65) * k5.y[i]);
         geodesicRhsV(rc, t, k6);
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < NSTATE; ++i)
             yOut.y[i] = y.y[i] + h * (vsplat(b1) * k1.y[i] + vsplat(b3) * k3.y[i] + vsplat(b4) * k4.y[i] + vsplat(b5) * k5.y[i] + vsplat(b6) * k6.y[i]);
         geodesicRhsV(rc, yOut, k7);
 
         vd err = vsplat(0.0);
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < NSTATE; ++i) {
             vd e  = h * (vsplat(e1) * k1.y[i] + vsplat(e3) * k3.y[i] + vsplat(e4) * k4.y[i]
                        + vsplat(e5) * k5.y[i] + vsplat(e6) * k6.y[i] + vsplat(e7) * k7.y[i]);
             vd sc = atol + rtol * vmax(vabs(y.y[i]), vabs(yOut.y[i]));
             vd q  = e / sc;
             err = err + q * q;
         }
-        return vsqrt(err * vsplat(1.0 / 5.0));
+        return vsqrt(err * vsplat(1.0 / NSTATE));
     }
 
     void buildInterpolant(const PacketState& y0, const PacketState& y1, vd h) {
@@ -119,7 +122,7 @@ struct PacketDP {
             d1 = -12715105075.0 / 11282082432.0, d3 = 87487479700.0 / 32700410799.0,
             d4 = -10690763975.0 / 1880347072.0,  d5 = 701980252875.0 / 199316789632.0,
             d6 = -1453857185.0 / 822651844.0,    d7 = 69997945.0 / 29380423.0;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < NSTATE; ++i) {
             c1.y[i] = y0.y[i];
             c2.y[i] = y1.y[i] - y0.y[i];
             c3.y[i] = h * k1.y[i] - c2.y[i];
@@ -136,7 +139,7 @@ struct PacketDP {
     }
     void interpolate(vd s, PacketState& out) const {
         vd s1 = vsplat(1.0) - s;
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < NSTATE; ++i)
             out.y[i] = c1.y[i] + s * (c2.y[i] + s1 * (c3.y[i] + s * (c4.y[i] + s1 * c5.y[i])));
     }
 
@@ -172,6 +175,7 @@ inline void runPacket(const Kerr& kerr, const Disk& disk, const Propagator& prop
         y.y[2][i] = on ? g[i].ph  : 0.0;
         y.y[3][i] = on ? g[i].pr  : 0.0;
         y.y[4][i] = on ? g[i].pth : 0.0;
+        y.y[5][i] = 0.0;
         E[i]      = on ? g[i].E   : 1.0;
         L[i]      = on ? g[i].L   : 0.0;
         alive[i]  = on ? -1LL : 0LL;
@@ -206,10 +210,10 @@ inline void runPacket(const Kerr& kerr, const Disk& disk, const Propagator& prop
     // Retire a lane: record its outcome and park it.
     auto retire = [&](int i, Term t, const PacketState& src) {
         out.term[i] = t;
-        for (int j = 0; j < 5; ++j) out.yEnd[i].y[j] = src.y[j][i];
+        for (int j = 0; j < NSTATE; ++j) out.yEnd[i].y[j] = src.y[j][i];
         alive[i] = 0;
         y.y[0][i] = 10.0; y.y[1][i] = HALF_PI; y.y[2][i] = 0.0;
-        y.y[3][i] = 0.0;  y.y[4][i] = 0.0;
+        y.y[3][i] = 0.0;  y.y[4][i] = 0.0; y.y[5][i] = 0.0;
     };
 
     for (int step = 0; step < prop.maxSteps && anyTrue(alive); ++step) {
@@ -253,7 +257,7 @@ inline void runPacket(const Kerr& kerr, const Disk& disk, const Propagator& prop
 
         // Advance accepted lanes that did not land on the disk.
         vi advance = accept & ~hitDisk;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < NSTATE; ++i) {
             y.y[i]     = vsel(advance, yn.y[i], y.y[i]);
             dp.k1.y[i] = vsel(advance, dp.k7.y[i], dp.k1.y[i]);
         }
@@ -295,8 +299,9 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
                         const Propagator& prop, Geodesic g[LANES],
                         const Real lambda0[LANES], Rng rng[LANES],
                         int maxBounces, int nActive, Real radianceOut[LANES],
-                        uint64_t* steps = nullptr)
+                        Real tObs = 0, uint64_t* steps = nullptr)
 {
+    Real travel[LANES] = {};      // light travel time back from the camera
     Real shift[LANES], throughput[LANES];
     int  bounce[LANES], crossings[LANES];
     bool alive[LANES];
@@ -340,6 +345,9 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
             Real ph  = res.yEnd[i].y[2];
             Real pth = res.yEnd[i].y[4];
 
+            travel[i] += res.yEnd[i].y[5];
+            Real tEmit = tObs - travel[i];
+
             Vec4 u  = disk.orbitVelocity(r);
             Real om = disk.orbitOmega(r);
             Real nu = u[0] * (g[i].E - om * g[i].L);
@@ -362,7 +370,7 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
             shift[i] *= nu;
             Real gs = 1 / shift[i];
             Real gs2 = gs * gs, gs5 = gs2 * gs2 * gs;
-            Real T = disk.temperature(r, ph);
+            Real T = disk.temperature(r, ph, tEmit);
             if (T > 0) radianceOut[i] += throughput[i] * gs5 * spec::planck(lambda0[i] * gs, T);
 
             if (bounce[i]++ >= maxBounces) { alive[i] = false; continue; }

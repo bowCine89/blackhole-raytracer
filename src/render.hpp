@@ -133,10 +133,16 @@ inline Vec3 asymptoticDirection(const Kerr& k, const State& y, Real E, Real L) {
 // local temperature T contributes g^5 * B_lambda(g * lambda0, T).
 inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
                       const Propagator& prop, Geodesic g, Real lambda0,
-                      Rng& rng, int maxBounces, uint64_t* steps = nullptr)
+                      Rng& rng, int maxBounces, Real tObs = 0,
+                      uint64_t* steps = nullptr)
 {
     Real radiance = 0;
     Real shift = 1;
+    // Coordinate time accumulated backwards along the path.  A photon reaching
+    // the camera at tObs left the surface it last touched `travel` earlier, so
+    // the far side of the disk and the lensed images are seen at earlier
+    // epochs than the near side.
+    Real travel = 0;
     // Stays at unity while the albedo is grey and scattering is chosen by
     // Russian roulette (survivors carry full weight).  It is carried explicitly
     // so a wavelength-dependent or non-Lambertian disk BRDF only has to touch
@@ -169,6 +175,10 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
         Real r  = yEnd.y[0];
         Real ph = yEnd.y[2];
         Real pth = yEnd.y[4];
+
+        // Each segment's integration starts its clock at zero, so accumulate.
+        travel += yEnd.y[5];
+        Real tEmit = tObs - travel;
 
         Vec4 u   = disk.orbitVelocity(r);
         Real om  = disk.orbitOmega(r);
@@ -205,7 +215,7 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
 
         Real gs = 1 / shift;
         Real gs2 = gs * gs, gs5 = gs2 * gs2 * gs;
-        Real T = disk.temperature(r, ph);
+        Real T = disk.temperature(r, ph, tEmit);
         if (T > 0) radiance += throughput * gs5 * spec::planck(lambda0 * gs, T);
 
         if (bounce++ >= maxBounces) break;

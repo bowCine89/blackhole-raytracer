@@ -146,16 +146,27 @@ struct Disk {
     }
 
     // Local effective temperature.  F = sigma T^4, so T scales as F^(1/4).
-    Real temperature(Real r, Real phi) const {
+    // `t` is the Boyer-Lindquist coordinate time of the emission event.
+    //
+    // The Novikov-Thorne disk itself is stationary and axisymmetric, so its
+    // temperature profile does not depend on either phi or t -- and an
+    // axisymmetric disk is, by construction, *invisibly* rotating: it looks
+    // identical at every instant.  What rotates on screen is the
+    // non-axisymmetric mottling, and it is advected with the gas.
+    //
+    // A fluid element at azimuth phi0 is at phi = phi0 + Omega(r) t, so
+    // sampling the pattern at phi - Omega(r) t follows the orbit exactly.
+    // Omega is the relativistic Keplerian rate already used for the Doppler
+    // shift, which is what makes the differential rotation correct rather than
+    // merely plausible: the ISCO laps the outer disk many times over.
+    Real temperature(Real r, Real phi, Real t) const {
         Real f = rawFlux(r);
         if (f <= 0) return 0;
         Real T = tPeak * std::pow(f, 0.25);
         if (turbulence > 0) {
-            // Mottling that shears with radius, as a differentially rotating
-            // flow would.  Purely cosmetic -- set --turbulence 0 for the clean
-            // Novikov-Thorne profile.
             Real u = std::log(r) * 6.0;
-            Real v = (phi + 2.5 * std::pow(r, -1.5) * 40.0) * (16 / TWO_PI);
+            Real phase = phi - orbitOmega(r) * t;
+            Real v = phase * (16 / TWO_PI);
             Real n = fbm2(u, v, 16, noiseSeed, 4);
             T *= (1 + turbulence * (2 * n - 1));
         }
