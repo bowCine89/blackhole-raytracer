@@ -654,7 +654,6 @@ int main(int argc, char** argv) {
         bake.step = (bakeStep > 0) ? bakeStep : (bake.orbitPeriod * bakeOrbits) / wanted;
         bake.maxFrames = std::min(bakeMax, wanted);
         bake.loopSpan = bake.step * bake.maxFrames;
-        if (bakeLoop) sc.disk.loopPeriod = bake.loopSpan;
     }
     const CameraParams home = camWanted;
 
@@ -1026,6 +1025,11 @@ int main(int argc, char** argv) {
                     S.rt.scale = desiredScale;
                     S.cam  = camWanted;   // published with every worker parked
                     S.tObs = tWanted;
+                    // The loop cross-fade belongs to a sequence, so it is only
+                    // in force while one is being captured.  Live mode shows
+                    // the plain advected pattern at whatever instant it is on.
+                    S.scene.disk.loopPeriod =
+                        (bakeLoop && mode == Mode::Baking) ? bake.loopSpan : Real(0);
                     resetAccumulation(S);
                 }
                 // Exactly one sample per tile while moving; unlimited once
