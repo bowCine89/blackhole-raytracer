@@ -102,10 +102,10 @@ coordinates:
 
 $$
 ds^2 = -\left(1 - \frac{2Mr}{\Sigma}\right)dt^2
--\frac{4Mar\sin^2\theta}{\Sigma}\,dt\,d\phi
-+\frac{\Sigma}{\Delta}\,dr^2
-+\Sigma\,d\theta^2
-+\frac{A\sin^2\theta}{\Sigma}\,d\phi^2
+-\frac{4Mar\sin^2\theta}{\Sigma}\mkern3mu dt\mkern3mu d\phi
++\frac{\Sigma}{\Delta}\mkern3mu dr^2
++\Sigma\mkern3mu d\theta^2
++\frac{A\sin^2\theta}{\Sigma}\mkern3mu d\phi^2
 $$
 
 with
@@ -147,7 +147,7 @@ code uses the Hamiltonian $\mathcal{H} = \tfrac12 g^{\mu\nu}p_\mu p_\nu$ and the
 rescaled quantity
 
 $$
-F \equiv \Sigma\, g^{\mu\nu}p_\mu p_\nu
+F \equiv \Sigma\mkern3mu  g^{\mu\nu}p_\mu p_\nu
 = \Delta p_r^2 + p_\theta^2
 +\frac{\left(L - aE\sin^2\theta\right)^2}{\sin^2\theta}
 -\frac{\left[E(r^2+a^2) - aL\right]^2}{\Delta},
@@ -158,7 +158,7 @@ $d\tau = d\lambda/\Sigma$, makes $F/2$ the Hamiltonian and cancels $\Sigma$ out
 of the $r$ and $\theta$ equations entirely. Writing $P = E(r^2+a^2) - aL$:
 
 $$
-\frac{dr}{d\tau} = \Delta\, p_r, \qquad
+\frac{dr}{d\tau} = \Delta\mkern3mu  p_r, \qquad
 \frac{d\theta}{d\tau} = p_\theta, \qquad
 \frac{d\phi}{d\tau} = \frac{L}{\sin^2\theta} - aE + \frac{aP}{\Delta},
 $$
@@ -203,7 +203,7 @@ the Page & Thorne (1974) flux is
 
 $$
 F(r) \propto \frac{1}{x^4\left(x^3 - 3x + 2a_\star\right)}
-\left[\, x - x_0 - \frac{3}{2}a_\star\ln\frac{x}{x_0}
+\left[\mkern3mu  x - x_0 - \frac{3}{2}a_\star\ln\frac{x}{x_0}
 -\sum_{i=1}^{3}\frac{3\left(x_i - a_\star\right)^2}{x_i\left(x_i-x_j\right)\left(x_i-x_k\right)}
 \ln\frac{x - x_i}{x_0 - x_i}\right]
 $$
@@ -232,7 +232,7 @@ Matter is on prograde circular geodesics:
 $$
 \Omega = \frac{M^{1/2}}{r^{3/2} + aM^{1/2}}, \qquad
 u^t = \frac{r^{3/2} + aM^{1/2}}{\sqrt{r^3 - 3Mr^2 + 2aM^{1/2}r^{3/2}}},
-\qquad u^\phi = \Omega\, u^t .
+\qquad u^\phi = \Omega\mkern3mu  u^t .
 $$
 
 This is what produces the beaming asymmetry: near the ISCO the orbital speed is
@@ -248,7 +248,7 @@ the disk is truncated.
 Each camera sample carries a **single wavelength** — the renderer is spectral,
 not RGB. Emission is a blackbody at the local temperature,
 
-$$B_\lambda(\lambda, T) = \frac{2hc^2}{\lambda^5}\,\frac{1}{e^{hc/\lambda k_B T} - 1},$$
+$$B_\lambda(\lambda, T) = \frac{2hc^2}{\lambda^5}\mkern3mu \frac{1}{e^{hc/\lambda k_B T} - 1},$$
 
 and transfer rides on the Lorentz invariant $I_\lambda \lambda^5$. Defining the
 shift factor between the camera and a local emitter with four-velocity $u^\mu$,
@@ -257,7 +257,7 @@ $$g = \frac{\nu_{\rm cam}}{\nu_{\rm local}}, \qquad \nu_{\rm local} = -p_\mu u^\
 
 the observed radiance at camera wavelength $\lambda_0$ is
 
-$$I_\lambda^{\rm obs}(\lambda_0) = g^5\, B_\lambda\!\left(g\lambda_0,\; T\right).$$
+$$I_\lambda^{\rm obs}(\lambda_0) = g^5\mkern3mu  B_\lambda\mkern-3mu \left(g\lambda_0,\mkern5mu  T\right).$$
 
 For the Keplerian disk this evaluates to $\nu_{\rm local} = u^t\left(E - \Omega L\right)$,
 and for the star field at infinity to $\nu_\infty = E$. A single running
@@ -281,13 +281,13 @@ What ends a disk observationally is its surface density dropping until it is no
 longer optically thick, so the meaningful quantity is optical depth, not a
 radius:
 
-$$\tau_\perp(r) = \min\left(\tau_{\max},\; \exp\frac{r_{\rm out} - r}{w}\right).$$
+$$\tau_\perp(r) = \min\left(\tau_{\max},\mkern5mu  \exp\frac{r_{\rm out} - r}{w}\right).$$
 
 `--rout` is then the photosphere edge ($\tau_\perp = 1$) rather than a wall, and
 `--edge` is the e-folding width $w$. Transfer through the layer is the
 isothermal-slab solution
 
-$$I_{\rm out} = I_{\rm in}\,e^{-\tau} + B_\lambda(T)\left(1 - e^{-\tau}\right),$$
+$$I_{\rm out} = I_{\rm in}\mkern3mu e^{-\tau} + B_\lambda(T)\left(1 - e^{-\tau}\right),$$
 
 sampled by passing the photon through untouched with probability $e^{-\tau}$ and
 otherwise letting the layer emit. Two things then happen together, as they must:
@@ -308,7 +308,7 @@ A ray crossing at a grazing angle passes through more material:
 
 $$
 \tau_{\rm eff} = \frac{\tau_\perp}{\lvert\mu\rvert}, \qquad
-\mu = \frac{p_\mu e_{\hat\theta}^{\,\mu}}{\nu_{\rm local}} = \frac{p_\theta}{r\,\nu_{\rm local}},
+\mu = \frac{p_\mu e_{\hat\theta}^{\mkern3mu \mu}}{\nu_{\rm local}} = \frac{p_\theta}{r\mkern3mu \nu_{\rm local}},
 $$
 
 since $e_{\hat\theta}$ is exactly $\partial_\theta$ normalised in the equatorial
@@ -339,7 +339,7 @@ survivors carry unit weight.
 
 That reproduces **returning radiation** — light that leaves the disk, is bent
 right around the hole, and lands back on it. With `--albedo 0.9 --bounces 3` it
-raises peak disk brightness by $\sim 19\%$ over the single-bounce result.
+raises peak disk brightness by $\sim 19$% over the single-bounce result.
 
 **Assumes:** a wavelength-independent albedo and isotropic re-emission, not a
 real electron-scattering atmosphere.
@@ -381,9 +381,9 @@ outshines the starlight it reflects by roughly ten orders of magnitude.
 Spectral radiance is integrated against the CIE 1931 standard observer,
 
 $$
-X = \int \bar{x}(\lambda)\,I_\lambda\,d\lambda, \qquad
-Y = \int \bar{y}(\lambda)\,I_\lambda\,d\lambda, \qquad
-Z = \int \bar{z}(\lambda)\,I_\lambda\,d\lambda,
+X = \int \bar{x}(\lambda)\mkern3mu I_\lambda\mkern3mu d\lambda, \qquad
+Y = \int \bar{y}(\lambda)\mkern3mu I_\lambda\mkern3mu d\lambda, \qquad
+Z = \int \bar{z}(\lambda)\mkern3mu I_\lambda\mkern3mu d\lambda,
 $$
 
 using the multi-lobe Gaussian fit of Wyman, Sloan & Shirley (2013), then
@@ -421,7 +421,7 @@ The two strongest are end-to-end.
 capture boundary. That boundary is a separatrix, so it is exquisitely sensitive
 to integration error, and it has a closed form at $r = r_{\rm ph}$:
 
-$$b_{\rm crit} = -\,\frac{r_{\rm ph}^3 - 3Mr_{\rm ph}^2 + a^2 r_{\rm ph} + a^2 M}{a\left(r_{\rm ph} - M\right)}.$$
+$$b_{\rm crit} = -\mkern3mu \frac{r_{\rm ph}^3 - 3Mr_{\rm ph}^2 + a^2 r_{\rm ph} + a^2 M}{a\left(r_{\rm ph} - M\right)}.$$
 
 Agreement is $\sim 10^{-10}$, including at $a_\star = 0.998$.
 
@@ -431,7 +431,7 @@ series
 $$
 \alpha = \frac{4M}{b} + \frac{15\pi}{4}\left(\frac{M}{b}\right)^{2}
 +\frac{128}{3}\left(\frac{M}{b}\right)^{3}
-+\mathcal{O}\!\left(\left(\frac{M}{b}\right)^{4}\right),
++\mathcal{O}\mkern-3mu \left(\left(\frac{M}{b}\right)^{4}\right),
 $$
 
 matching to $8\times10^{-5}$. This exercises the integrator *and* the
