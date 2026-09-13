@@ -6,3 +6,8 @@
 *.pfm
 *.obj
 kerrview-*.png
+*.avi
+*.log
+blackhole-*.png
+kerrbake-*.png
+*.err

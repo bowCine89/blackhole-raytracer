@@ -17,6 +17,7 @@
 #include "render.hpp"
 #include "packet.hpp"
 #include "image.hpp"
+#include "video.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -77,6 +78,11 @@ struct Config {
     Real  tObs = 0.0;                // observer coordinate time, in M
     int   frames = 1;                // >1 renders a sequence
     Real  tStep = -1;                // M between frames; <0 = one ISCO orbit/frames
+    Real  orbits = 1.0;              // ISCO orbits the sequence spans
+    bool  loop = false;              // make the sequence close exactly on itself
+    std::string video;               // also stream the sequence to this .avi
+    double fps = 24.0;               // playback rate written into the container
+    bool  writePng = true;           // --no-png keeps only the video
 };
 
 // ---------------------------------------------------------------------------
@@ -356,6 +362,42 @@ static int runChecks() {
                     leastChange > 1e-3 ? "ok" : "FAIL");
     }
 
+    // --- loop closure -------------------------------------------------------
+    // With a loop period set, the sequence must return to its starting state
+    // exactly at T -- at every radius at once, which plain advection cannot do
+    // because each ring has its own period.  The pattern must still move in
+    // between, or the check would pass trivially on a frozen disk.
+    {
+        Kerr k(0.94);
+        Disk d;
+        d.turbulence = 0.15;
+        d.init(k, -1, 18.0);
+        const Real T = TWO_PI / d.orbitOmega(d.kerr.isco(true));   // one ISCO orbit
+        d.loopPeriod = T;
+
+        Real worstWrap = 0, leastMotion = 1e30;
+        for (Real r : {2.5, 4.0, 6.0, 10.0, 16.0}) {
+            for (Real phi : {0.0, 1.1, 2.7, 4.9}) {
+                Real a = d.temperature(r, phi, 0.0);
+                Real b = d.temperature(r, phi, T);            // one loop on
+                Real c2 = d.temperature(r, phi, 3 * T);       // and three
+                Real m = d.temperature(r, phi, T * 0.37);     // somewhere inside
+                worstWrap = std::max({worstWrap,
+                                      std::fabs(b - a) / std::max<Real>(a, 1e-9),
+                                      std::fabs(c2 - a) / std::max<Real>(a, 1e-9)});
+                leastMotion = std::min(leastMotion, std::fabs(m - a) / std::max<Real>(a, 1e-9));
+            }
+        }
+        if (!(worstWrap < 1e-12)) ++failures;
+        if (!(leastMotion > 1e-3)) ++failures;
+        std::printf("  %-46s %14.3e  (tolerance %9.1e)              %s\n",
+                    "loop mode returns to its start at every radius", worstWrap, 1e-12,
+                    worstWrap < 1e-12 ? "ok" : "FAIL");
+        std::printf("  %-46s %14.3e  (must exceed %9.1e)           %s\n",
+                    "...while still moving inside the loop", leastMotion, 1e-3,
+                    leastMotion > 1e-3 ? "ok" : "FAIL");
+    }
+
     // --- SIMD layer ---------------------------------------------------------
     // The packet tracer replaces libm sin/cos with its own vector version, so
     // that has to be held to libm before anything built on it can be trusted.
@@ -491,6 +533,16 @@ static void usage() {
 "  --bloom F                   bloom strength, 0 disables      (0.16)\n"
 "  --desat F                   highlight desaturation          (0.85)\n"
 "\n"
+"Animation\n"
+"  --time T                    observer coordinate time, in M  (0)\n"
+"  --frames N                  render a sequence of N frames   (1)\n"
+"  --orbits F                  ISCO orbits the sequence spans  (1)\n"
+"  --tstep T                   M between frames, overrides --orbits\n"
+"  --loop                      close the sequence exactly on itself\n"
+"  --video FILE                also write an uncompressed .avi\n"
+"  --fps F                     playback rate for --video       (24)\n"
+"  --no-png                    with --video, skip the frame PNGs\n"
+"\n"
 "Accuracy\n"
 "  --rtol F                    integrator relative tolerance   (1e-6)\n"
 "  --max-steps N               step budget per ray             (60000)\n"
@@ -555,6 +607,11 @@ int main(int argc, char** argv) {
         else if (s == "--time")        c.tObs = needF(i);
         else if (s == "--frames")      c.frames = needI(i);
         else if (s == "--tstep")       c.tStep = needF(i);
+        else if (s == "--orbits")      c.orbits = needF(i);
+        else if (s == "--loop")        c.loop = true;
+        else if (s == "--video")       c.video = argv[++i];
+        else if (s == "--fps")         c.fps = needF(i);
+        else if (s == "--no-png")      c.writePng = false;
         else if (s == "--help" || s == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", s.c_str()); usage(); return 2; }
     }
@@ -628,15 +685,44 @@ int main(int argc, char** argv) {
     // The default step covers exactly one ISCO orbital period across the whole
     // sequence, which is the natural unit -- the innermost ring returns to where
     // it began, while the outer disk has barely moved.
+    const Real periodIsco = TWO_PI / disk.orbitOmega(kerr.isco(true));
     Real tStep = c.tStep;
-    if (tStep < 0) {
-        Real periodIsco = TWO_PI / disk.orbitOmega(kerr.isco(true));
-        tStep = periodIsco / std::max(1, c.frames);
+    if (tStep < 0) tStep = periodIsco * c.orbits / std::max(1, c.frames);
+
+    const Real seqSpan = tStep * std::max(1, c.frames);
+
+    // Close the sequence on itself.  Every ring keeps its true orbital rate;
+    // the pattern is cross-faded against a copy one loop-length older so the
+    // last frame runs back into the first without a jump.
+    if (c.loop) {
+        disk.loopPeriod = seqSpan;
+        if (!c.quiet && c.frames > 1)
+            std::printf("  loop              exact over %.1f M (%.2f ISCO orbits); "
+                        "rotation rates unchanged\n",
+                        double(seqSpan), double(seqSpan / periodIsco));
     }
+
     if (!c.quiet && c.frames > 1) {
-        std::printf("  sequence          %d frames, %.3f M apart (ISCO period %.1f M)\n",
-                    c.frames, double(tStep), double(TWO_PI / disk.orbitOmega(kerr.isco(true))));
+        std::printf("  sequence          %d frames, %.3f M apart (ISCO period %.1f M, %.2f orbits)\n",
+                    c.frames, double(tStep), double(periodIsco),
+                    double(seqSpan / periodIsco));
         std::fflush(stdout);
+    }
+
+    // Stream the sequence into an uncompressed AVI as it renders, so the loop
+    // is playable without a post-processing step and nothing is ever held in
+    // memory beyond the frame being written.
+    vid::AviWriter avi;
+    bool videoOpen = false;
+    if (!c.video.empty() && c.frames > 1) {
+        videoOpen = avi.open(c.video, c.width, c.height, c.fps);
+        if (!videoOpen)
+            std::fprintf(stderr, "cannot open %s for writing; continuing without video\n",
+                         c.video.c_str());
+        else if (!c.quiet)
+            std::printf("  video             %s   %dx%d @ %.0f fps   %.0f MB when full\n",
+                        c.video.c_str(), c.width, c.height, c.fps,
+                        double(size_t(((c.width * 3 + 3) / 4) * 4) * c.height * c.frames) / 1.0e6);
     }
 
     const Real tStart = c.tObs;
@@ -837,7 +923,9 @@ int main(int argc, char** argv) {
         out8[i * 3 + 2] = uint8_t(clampf(spec::srgbEncode(b) * 255.0 + 0.5, 0, 255));
     }
 
-    if (!img::writePng(outPath, W, H, out8)) {
+    if (videoOpen) avi.addFrame(out8.data());
+
+    if (c.writePng && !img::writePng(outPath, W, H, out8)) {
         std::fprintf(stderr, "failed to write %s\n", outPath.c_str());
         return 1;
     }
@@ -845,8 +933,11 @@ int main(int argc, char** argv) {
         if (c.frames > 1) {
             double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - seqStart).count();
             double eta = elapsed / (frame + 1) * (c.frames - frame - 1);
+            char what[512];
+            if (c.writePng) std::snprintf(what, sizeof what, "%s", outPath.c_str());
+            else            std::snprintf(what, sizeof what, "%s (frame %d)", c.video.c_str(), frame);
             std::printf("  wrote            %s   t = %.2f M   [%d/%d, %.0f s remaining]\n",
-                        outPath.c_str(), double(c.tObs), frame + 1, c.frames, eta);
+                        what, double(c.tObs), frame + 1, c.frames, eta);
         } else {
             std::printf("  wrote            %s\n", outPath.c_str());
         }
@@ -854,5 +945,15 @@ int main(int argc, char** argv) {
     }
 
     }   // end frame loop
+
+    if (videoOpen) {
+        avi.close();
+        if (!c.quiet)
+            std::printf("\n  video             %s   %d frames, %dx%d, %.0f fps, %.0f MB\n"
+                        "                    %.2f s of playback, spanning %.2f ISCO orbits\n",
+                        c.video.c_str(), avi.frames(), c.width, c.height, c.fps,
+                        avi.bytes() / 1.0e6, avi.frames() / c.fps,
+                        double(seqSpan / periodIsco));
+    }
     return 0;
 }

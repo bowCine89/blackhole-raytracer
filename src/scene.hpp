@@ -50,6 +50,7 @@ struct Disk {
     Real   tPeak = 12000;        // K, peak effective temperature
     Real   albedo = 0.2;         // grey scattering albedo of the disk surface
     Real   turbulence = 0.15;    // cosmetic temperature mottling, 0 disables
+    Real   loopPeriod = 0;       // >0: close the mottling exactly on a T-long loop
     uint32_t noiseSeed = 12345;
 
     // --- outer edge ---------------------------------------------------------
@@ -145,9 +146,6 @@ struct Disk {
         return std::max<Real>(0, f) * fluxNorm;
     }
 
-    // Local effective temperature.  F = sigma T^4, so T scales as F^(1/4).
-    // `t` is the Boyer-Lindquist coordinate time of the emission event.
-    //
     // The Novikov-Thorne disk itself is stationary and axisymmetric, so its
     // temperature profile does not depend on either phi or t -- and an
     // axisymmetric disk is, by construction, *invisibly* rotating: it looks
@@ -159,17 +157,48 @@ struct Disk {
     // Omega is the relativistic Keplerian rate already used for the Doppler
     // shift, which is what makes the differential rotation correct rather than
     // merely plausible: the ISCO laps the outer disk many times over.
+
+    // Zero-mean mottling at (r, phi) and coordinate time t, in [-1, 1].
+    //
+    // A sequence of length T repeats only if every ring has come back to where
+    // it started, i.e. if Omega(r) T / 2pi is a whole number at every radius.
+    // Differential rotation makes that impossible: the ISCO turns once in 24 M
+    // while r = 18 M needs 485 M, so no single T divides both, and a sequence
+    // cut at one orbit jumps visibly when it wraps.
+    //
+    // Forcing the turn counts to whole numbers would close the loop but would
+    // have to run the outer disk some twenty times too fast, which is worse
+    // than the seam.  Instead the pattern is cross-faded against a copy of
+    // itself one loop-length older.  At t = 0 the weight is entirely on the
+    // first copy and at t = T entirely on the second, which is the same field
+    // shifted by exactly T -- so the two ends agree identically, while both
+    // terms are carried round at the true orbital rate throughout.  The weights
+    // are divided by sqrt((1-w)^2 + w^2) so the mottling keeps its contrast
+    // across the blend instead of washing out at the midpoint.
+    //
+    // Only the cosmetic pattern is touched.  The flux profile, Doppler shift,
+    // lensing and redshift are all stationary, so nothing physical is bent.
+    Real mottle(Real r, Real phi, Real t) const {
+        const Real toV = 16 / TWO_PI;
+        Real u  = std::log(r) * 6.0;
+        Real om = orbitOmega(r);
+        if (loopPeriod <= 0)
+            return 2 * fbm2(u, (phi - om * t) * toV, 16, noiseSeed, 4) - 1;
+
+        Real tau = t - loopPeriod * std::floor(t / loopPeriod);   // into [0, T)
+        Real w   = tau / loopPeriod;
+        Real d1  = 2 * fbm2(u, (phi - om * tau) * toV, 16, noiseSeed, 4) - 1;
+        Real d2  = 2 * fbm2(u, (phi - om * (tau - loopPeriod)) * toV, 16, noiseSeed, 4) - 1;
+        return ((1 - w) * d1 + w * d2) / std::sqrt((1 - w) * (1 - w) + w * w);
+    }
+
+    // Local effective temperature.  F = sigma T^4, so T scales as F^(1/4).
+    // `t` is the Boyer-Lindquist coordinate time of the emission event.
     Real temperature(Real r, Real phi, Real t) const {
         Real f = rawFlux(r);
         if (f <= 0) return 0;
         Real T = tPeak * std::pow(f, 0.25);
-        if (turbulence > 0) {
-            Real u = std::log(r) * 6.0;
-            Real phase = phi - orbitOmega(r) * t;
-            Real v = phase * (16 / TWO_PI);
-            Real n = fbm2(u, v, 16, noiseSeed, 4);
-            T *= (1 + turbulence * (2 * n - 1));
-        }
+        if (turbulence > 0) T *= (1 + turbulence * mottle(r, phi, t));
         return T;
     }
 

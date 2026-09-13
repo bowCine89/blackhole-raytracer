@@ -27,6 +27,7 @@
 #include "render.hpp"
 #include "packet.hpp"
 #include "image.hpp"
+#include "video.hpp"
 
 #include <SDL2/SDL.h>
 
@@ -451,9 +452,33 @@ struct Bake {
     double playHead  = 0;        // fractional frame index
     double lockedExposure = 0;   // frozen during a bake, so playback cannot flicker
 
+    Real   orbitPeriod = 24.0;   // ISCO orbital period, the natural loop unit
+    Real   loopSpan    = 0;      // planned sequence length; the loop closes on it
+    std::string videoPath;       // empty disables the video
+
     size_t bytes() const { return frames.empty() ? 0 : frames.size() * frames[0].size(); }
     Real   span()  const { return frames.empty() ? 0 : Real(frames.size()) * step; }
+    Real   orbits() const { return span() / orbitPeriod; }
 };
+
+// Write the captured sequence as an uncompressed AVI: lossless, no dependency,
+// and directly playable.  Each frame cost seconds to converge, so there is no
+// case for throwing quality away on the way to disk.
+static bool writeBakeVideo(const Bake& bake, int w, int h) {
+    if (bake.videoPath.empty() || bake.frames.size() < 2) return false;
+    vid::AviWriter avi;
+    if (!avi.open(bake.videoPath, w, h, bake.fps)) {
+        std::printf("  could not open %s for writing\n", bake.videoPath.c_str());
+        return false;
+    }
+    for (const auto& f : bake.frames) avi.addFrame(f.data());
+    avi.close();
+    std::printf("  wrote %s   %d frames, %dx%d, %.0f fps, %.0f MB   (%.2f ISCO orbits)\n",
+                bake.videoPath.c_str(), avi.frames(), w, h, bake.fps,
+                avi.bytes() / 1.0e6, double(bake.orbits()));
+    std::fflush(stdout);
+    return true;
+}
 
 static void printControls() {
     std::printf(
@@ -477,7 +502,10 @@ static void printControls() {
 "converge.  SPACE bakes a sequence instead -- the camera holds still, each\n"
 "frame is taken to --bake-spp samples before the clock advances -- and loops\n"
 "it back when you press SPACE again.  The window title always says what SPACE\n"
-"will do next.\n\n");
+"will do next.  The finished sequence is written as an uncompressed .avi.\n"
+"\n"
+"The bake covers one ISCO orbit and closes exactly on itself; --no-loop keeps\n"
+"the untouched pattern instead, which leaves a visible jump at the wrap.\n\n");
 }
 
 int main(int argc, char** argv) {
@@ -489,7 +517,11 @@ int main(int argc, char** argv) {
     Real targetFps = 30.0;
     int   bakeSpp = 64;      // samples per pixel before a baked frame is kept
     int   bakeMax = 180;     // frame cap; about 500 MB at 720p
-    Real  bakeStep = -1;     // M between frames; <0 = one ISCO orbit / 96
+    Real  bakeStep = -1;     // M between frames; <0 = derived from orbits/frames
+    Real  bakeOrbits = 1.0;  // bake exactly this many ISCO orbits, then stop
+    bool  bakeLoop   = true;  // --no-loop renders the true pattern with a visible seam
+    int   bakeFrames = 96;   // frames per orbit
+    std::string videoOut = "kerrbake.avi";
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     int    autoBake = 0;        // scripted: bake N frames, play, then quit
@@ -521,6 +553,11 @@ int main(int argc, char** argv) {
         else if (a == "--bake-spp")   bakeSpp = nextI();
         else if (a == "--bake-step")  bakeStep = nextF();
         else if (a == "--bake-max")   bakeMax = nextI();
+        else if (a == "--bake-orbits") bakeOrbits = nextF();
+        else if (a == "--no-loop")    bakeLoop = false;
+        else if (a == "--bake-frames") bakeFrames = nextI();
+        else if (a == "--video")      videoOut = argv[++i];
+        else if (a == "--no-video")   videoOut.clear();
         else if (a == "--autobake")   autoBake = nextI();
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
@@ -604,9 +641,21 @@ int main(int argc, char** argv) {
     Mode mode = Mode::Live;
     Bake bake;
     bake.targetSpp = bakeSpp;
-    bake.maxFrames = bakeMax;
-    bake.step = (bakeStep > 0) ? bakeStep
-                              : (TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true))) / 96.0;
+    bake.videoPath = videoOut;
+    bake.orbitPeriod = TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true));
+    {
+        // Default to exactly one ISCO orbit, and tell the disk that is the loop
+        // length.  Differential rotation means no span returns every ring to
+        // its start on its own -- the outer disk needs twenty times as long as
+        // the ISCO -- so the pattern is cross-faded against a copy one loop
+        // older instead, which makes the last frame run back into the first
+        // without touching any rotation rate.  See Disk::mottle.
+        int wanted = std::max(2, int(bakeFrames * bakeOrbits + 0.5));
+        bake.step = (bakeStep > 0) ? bakeStep : (bake.orbitPeriod * bakeOrbits) / wanted;
+        bake.maxFrames = std::min(bakeMax, wanted);
+        bake.loopSpan = bake.step * bake.maxFrames;
+        if (bakeLoop) sc.disk.loopPeriod = bake.loopSpan;
+    }
     const CameraParams home = camWanted;
 
     bool  dragOrbit = false, dragPan = false;
@@ -672,6 +721,7 @@ int main(int argc, char** argv) {
                     std::snprintf(nm, sizeof nm, "kerrbake-%04zu.png", i);
                     img::writePng(nm, winW, winH, bake.frames[i]);
                 }
+                writeBakeVideo(bake, winW, winH);
                 std::printf("  [auto] playing %zu frames (exported for inspection)\n",
                             bake.frames.size());
                 std::fflush(stdout);
@@ -774,6 +824,7 @@ int main(int argc, char** argv) {
                         if (bake.frames.size() >= 2) {
                             mode = Mode::Playing;
                             bake.playHead = 0;
+                            writeBakeVideo(bake, winW, winH);
                             std::printf("  PLAYING %zu frames at %.0f fps (%.1f M, %.2f ISCO orbits)."
                                         "  SPACE for live.\n",
                                         bake.frames.size(), bake.fps, double(bake.span()),
@@ -912,6 +963,7 @@ int main(int argc, char** argv) {
                 if (int(bake.frames.size()) >= bake.maxFrames) {
                     mode = Mode::Playing;
                     bake.playHead = 0;
+                    writeBakeVideo(bake, winW, winH);
                     std::printf("  frame limit reached; PLAYING %zu frames\n", bake.frames.size());
                     std::fflush(stdout);
                 }

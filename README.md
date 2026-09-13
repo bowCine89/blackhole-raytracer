@@ -131,15 +131,21 @@ Three details that matter more than they look:
   stop rather than burning cores on a finished image.
 
 The console reports each captured frame with the fraction of an ISCO orbit
-accumulated so far, and flags whole-orbit marks as good places to stop — the
-inner ring is then back where it began. `s` during playback writes the whole
-sequence as `kerrbake-0000.png …`.
+accumulated so far. `s` during playback writes the whole sequence as
+`kerrbake-0000.png …`.
 
-Note that a loop is never perfectly seamless, for the reason given under
-[Offline animation](#offline-animation): differential rotation gives every
-radius its own period, so no single duration returns the whole disk to its
-starting state. Stopping on a whole ISCO orbit makes the bright inner region
-loop cleanly, and the slow outer disk shifts only a few percent.
+**The finished sequence is written as an uncompressed AVI** — `kerrbake.avi` by
+default, or wherever `--video` points — so it can be played back outside the
+viewer at exactly the quality it was rendered at. It is written at every point a
+bake ends: the frame limit, `SPACE`, or a scripted run. `--no-video` skips it.
+
+The bake targets **one full ISCO orbit** by default (`--bake-orbits`,
+`--bake-frames`), and the sequence closes exactly on itself by the cross-fade
+construction described under [Making the loop close](#making-the-loop-close) —
+no rotation rate is altered to achieve it. `--no-loop` renders the plain
+advection instead, which leaves a visible jump at the wrap. Note that stopping a
+bake early with `SPACE` yields fewer frames than the planned loop length, so
+that video will not close; let it reach the frame limit for a clean loop.
 
 `--bake-spp`, `--bake-step` and `--bake-max` set convergence per frame,
 coordinate time between frames, and the frame cap (180 frames is about 500 MB at
@@ -544,11 +550,74 @@ it spreads the sequence across exactly one ISCO orbital period, which is the
 natural unit — the innermost ring returns to where it started while the outer
 disk has barely moved.
 
-A caveat worth stating: **the sequence cannot loop seamlessly**, and no choice
-of step makes it. Differential rotation means every radius has its own period —
-24 M at the ISCO against 420 M at $r = 16M$ — so there is no time at which the
-whole disk simultaneously returns to its initial state. That is the physics
-being right, not the renderer being careless.
+#### Video export
+
+`--video` streams the same sequence into an uncompressed AVI as it renders:
+
+```powershell
+.\kerr.exe --frames 96 --orbits 1 --loop --video kerr-orbit.avi --no-png
+```
+
+The container is written by `src/video.hpp` — no dependency, no encoder, and no
+lossy step between the tone mapper and the file. Frames go out as they finish,
+so the sequence is never held in memory. The cost is size: $1280\times720\times3$
+bytes a frame, about 265 MB for a 96-frame loop. Transcode afterwards if
+something smaller is wanted; the other direction is not available. `--fps` sets
+the playback rate stamped into the header, and `--no-png` keeps only the video.
+
+#### Making the loop close
+
+The obvious choice — run the sequence for exactly one ISCO orbit — does **not**
+produce a seamless loop, and it is worth being precise about why.
+
+Rendering is deterministic, so the question can be measured rather than argued.
+Two renders of the same instant differ by exactly zero, and with `--turbulence 0`
+two renders $12M$ apart also differ by exactly zero: the Novikov–Thorne flux,
+the lensing, the Doppler beaming and the redshift are all *stationary*. The only
+time-dependent term in the entire image is the advected mottling. So the whole
+question of loop closure is a question about that one field.
+
+A sequence of length $T$ repeats only if every ring has come back to where it
+started, that is, only if
+
+$$\frac{\Omega(r)\mkern3mu T}{2\pi} \in \mathbb{Z} \quad \text{for every } r .$$
+
+Differential rotation makes this unsatisfiable. The ISCO turns once in $24M$
+while $r = 18M$ needs $485M$, a ratio of about 20, and no single $T$ divides
+both. Cut at one ISCO orbit, the wrap is a visible jump — measured at **17×**
+the difference between two ordinary consecutive frames.
+
+Rounding the turn counts to whole numbers would close the loop, but only by
+running the outer disk some **1900%** too fast, which looks far worse than the
+seam. Instead the pattern is cross-faded against a copy of itself one loop-length
+older. With $\tau = t - T\lfloor t/T\rfloor$ and $w = \tau/T$,
+
+$$d_{\text{loop}}(r,\phi,t) = \frac{(1-w)\mkern3mu d(r,\phi,\tau) + w\mkern3mu d(r,\phi,\tau - T)}{\sqrt{(1-w)^2 + w^2}} .$$
+
+At $w = 0$ the weight sits entirely on the first copy; at $w = 1$ entirely on
+the second, which is the same field displaced by exactly $T$ — so the two ends
+of the sequence are *identically* equal. Both terms are carried round at the
+true $\Omega(r)$ throughout, so no rotation rate is altered anywhere in the
+disk. The denominator holds the variance constant across the blend, which stops
+the mottling washing out at the midpoint.
+
+Measured at 96 frames over one ISCO orbit, $320\times180$, 64 spp:
+
+| | consecutive frames | seam at the wrap | ratio |
+|---|---|---|---|
+| default | 0.359 LSB rms | 4.96 LSB rms | **17×** |
+| `--loop` | 0.359 LSB rms | 0.377 LSB rms | **1.05×** |
+
+With `--loop` the wrap is indistinguishable from any other frame boundary — its
+largest single-channel deviation, 7 LSB, is in fact *smaller* than an ordinary
+step's 10 LSB. `--check` holds this to $3\times10^{-16}$ at every radius at once,
+while separately confirming the pattern still moves inside the loop.
+
+What is bent is cosmetic and only cosmetic: a real disk's turbulence never
+repeats, and the cross-fade is a compositing choice about an ornamental field,
+not a physical claim. Every quantity the renderer computes from the metric is
+left exactly as it was. `--loop` is opt-in; without it the advection is the
+plain one and the seam is real.
 
 **On "the right speed" in wall-clock terms.** There isn't one: it depends
 entirely on the mass. $24M$ at the ISCO is 1.2 ms for a 10 $M_\odot$ hole, about
@@ -730,6 +799,10 @@ its own output:
   disk u^t at r=1000 (weak field)                   1.001503298  relerr 8.52e-08
   disk inner edge == ISCO                           2.320883042  relerr 0.00e+00
   Page-Thorne flux vanishes at the ISCO                                      ok
+  disk pattern closes after one orbital period        5.982e-16
+  ...and differs at half a period                     3.985e-03
+  loop mode returns to its start at every radius      3.419e-16
+  ...while still moving inside the loop               2.787e-03
 ```
 
 The two strongest are end-to-end.
@@ -886,7 +959,7 @@ compaction is paid for.
 Image     --width --height --spp --bounces --threads --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
 Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
-Animation --time --frames --tstep
+Animation --time --frames --orbits --tstep --loop --video --fps --no-png
 Sky       --sky-gain --star-density --band --nostars
 Tone map  --exposure --key --bloom --desat
 Accuracy  --rtol --max-steps --no-simd
@@ -908,6 +981,12 @@ Shots that exercise different corners of the models:
 .\kerr.exe --edge 3 --rout 14                   # a broad, diffuse outer rim
 .\kerr.exe --turbulence 0 --nostars             # clean Novikov-Thorne profile
 .\kerr.exe --rout 0.01 --sky-gain 1.0           # pure lensing, no disk
+```
+
+A full-orbit looping video, which is what the animation path is for:
+
+```powershell
+.\kerr.exe --frames 96 --orbits 1 --loop --spp 128 --video kerr-orbit.avi --no-png
 ```
 
 ---
@@ -942,6 +1021,7 @@ src/kerr.hpp      Kerr metric, geodesic RHS, Dormand-Prince, tetrads
 src/scene.hpp     Novikov-Thorne disk, optical-depth edge, star field
 src/spectrum.hpp  Planck, CIE 1931, sRGB, ACES
 src/image.hpp     PNG / PPM / PFM writers (no libraries)
+src/video.hpp     streaming uncompressed AVI writer (no libraries)
 src/simd.hpp      8-wide vector types, vectorised sincos and fifth root
 src/packet.hpp    SoA Dormand-Prince and packet path tracing
 src/render.hpp    scalar propagation and path tracing, camera -- the reference
