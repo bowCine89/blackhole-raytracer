@@ -25,6 +25,7 @@
 #include "spectrum.hpp"
 #include "scene.hpp"
 #include "render.hpp"
+#include "packet.hpp"
 #include "image.hpp"
 
 #include <SDL2/SDL.h>
@@ -122,59 +123,76 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
     const double expScale = S.exposure.load(std::memory_order_relaxed);
     uint64_t traced = 0;
 
+    // Deposit one finished sample and repaint the block it stands for.
+    auto shade = [&](size_t idx, int x, int y, Real lambda, Real L) {
+        double* a = &S.accum[idx * 3];
+        if (L > 0) {
+            Vec3 c = spec::cieXYZ(lambda);
+            a[0] += c.x * L; a[1] += c.y * L; a[2] += c.z * L;
+        }
+        uint32_t n = ++S.count[idx];
+
+        // Tone map this pixel now, while its data is hot in cache.
+        Real inv = sc.lamScale / n * expScale;
+        Vec3 v = spec::xyzToLinearSrgb({a[0] * inv, a[1] * inv, a[2] * inv});
+        v = spec::desaturateHighlights({std::max<Real>(0, v.x),
+                                        std::max<Real>(0, v.y),
+                                        std::max<Real>(0, v.z)}, 0.85);
+        uint8_t r8 = uint8_t(clampf(spec::srgbEncode(spec::acesFilmic(v.x)) * 255.0 + 0.5, 0, 255));
+        uint8_t g8 = uint8_t(clampf(spec::srgbEncode(spec::acesFilmic(v.y)) * 255.0 + 0.5, 0, 255));
+        uint8_t b8 = uint8_t(clampf(spec::srgbEncode(spec::acesFilmic(v.z)) * 255.0 + 0.5, 0, 255));
+
+        int bx0 = x * rt.scale, by0 = y * rt.scale;
+        int bx1 = std::min(bx0 + rt.scale, rt.winW);
+        int by1 = std::min(by0 + rt.scale, rt.winH);
+        for (int by = by0; by < by1; ++by) {
+            uint8_t* row = &S.display[(size_t(by) * rt.winW + bx0) * 3];
+            for (int bx = bx0; bx < bx1; ++bx) { *row++ = r8; *row++ = g8; *row++ = b8; }
+        }
+    };
+
+    // Eight horizontally adjacent pixels form a packet.  Neighbouring pixels at
+    // the same sample index are the most coherent grouping available here, so
+    // lane divergence stays low.
     for (int y = ty; y < y1; ++y) {
-        for (int x = tx; x < x1; ++x) {
-            const size_t idx = size_t(y) * rt.rw + x;
+        for (int x = tx; x < x1; x += LANES) {
+            const int n = std::min(LANES, x1 - x);
 
-            // Low-discrepancy offsets: an R2 sequence in the sample index,
-            // Cranley-Patterson rotated per pixel so neighbours decorrelate.
-            uint32_t h = hashU32(uint32_t(idx) * 2654435761u + 1u);
-            Real o1 = hashFloat(h);
-            Real o2 = hashFloat(hashU32(h ^ 0x9e3779b9u));
-            Real o3 = hashFloat(hashU32(h ^ 0x85ebca6bu));
+            Geodesic gp[LANES];
+            Real     lam[LANES];
+            Rng      rgs[LANES];
+            size_t   idxs[LANES];
 
-            Real u1 = fract(0.7548776662 * Real(sampleIdx) + o1);
-            Real u2 = fract(0.5698402910 * Real(sampleIdx) + o2);
-            Real ul = fract(0.6180339887 * Real(sampleIdx) + o3);
+            for (int j = 0; j < n; ++j) {
+                const int px = x + j;
+                const size_t idx = size_t(y) * rt.rw + px;
+                idxs[j] = idx;
 
-            Rng rng(idx + 1, sc.seed + sampleIdx * 0x9E3779B97F4A7C15ull);
+                // Low-discrepancy offsets: an R2 sequence in the sample index,
+                // Cranley-Patterson rotated per pixel so neighbours decorrelate.
+                uint32_t h = hashU32(uint32_t(idx) * 2654435761u + 1u);
+                Real o1 = hashFloat(h);
+                Real o2 = hashFloat(hashU32(h ^ 0x9e3779b9u));
+                Real o3 = hashFloat(hashU32(h ^ 0x85ebca6bu));
 
-            Real lambda = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
-            Real sx = 2.0 * (x + u1) / rt.rw - 1.0;
-            Real sy = 1.0 - 2.0 * (y + u2) / rt.rh;
+                Real u1 = fract(0.7548776662 * Real(sampleIdx) + o1);
+                Real u2 = fract(0.5698402910 * Real(sampleIdx) + o2);
+                Real ul = fract(0.6180339887 * Real(sampleIdx) + o3);
 
-            Geodesic g = cam.ray(sx, sy);
-            Real L = tracePath(sc.kerr, sc.disk, sc.sky, sc.prop, g, lambda,
-                               rng, sc.maxBounces);
-            ++traced;
+                rgs[j] = Rng(idx + 1, sc.seed + sampleIdx * 0x9E3779B97F4A7C15ull);
+                lam[j] = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
 
-            double* a = &S.accum[idx * 3];
-            if (L > 0) {
-                Vec3 c = spec::cieXYZ(lambda);
-                a[0] += c.x * L; a[1] += c.y * L; a[2] += c.z * L;
+                Real sx = 2.0 * (px + u1) / rt.rw - 1.0;
+                Real sy = 1.0 - 2.0 * (y + u2) / rt.rh;
+                gp[j] = cam.ray(sx, sy);
             }
-            uint32_t n = ++S.count[idx];
 
-            // Tone map this pixel now, while its data is hot in cache.
-            Real inv = sc.lamScale / n * expScale;
-            Vec3 v = spec::xyzToLinearSrgb({a[0] * inv, a[1] * inv, a[2] * inv});
-            v = spec::desaturateHighlights({std::max<Real>(0, v.x),
-                                            std::max<Real>(0, v.y),
-                                            std::max<Real>(0, v.z)}, 0.85);
-            uint8_t r8 = uint8_t(clampf(spec::srgbEncode(spec::acesFilmic(v.x)) * 255.0 + 0.5, 0, 255));
-            uint8_t g8 = uint8_t(clampf(spec::srgbEncode(spec::acesFilmic(v.y)) * 255.0 + 0.5, 0, 255));
-            uint8_t b8 = uint8_t(clampf(spec::srgbEncode(spec::acesFilmic(v.z)) * 255.0 + 0.5, 0, 255));
+            Real rad[LANES];
+            tracePacket(sc.kerr, sc.disk, sc.sky, sc.prop, gp, lam, rgs,
+                        sc.maxBounces, n, rad);
+            traced += uint64_t(n);
 
-            // Paint the scale x scale block this render pixel stands for.
-            int bx0 = x * rt.scale, by0 = y * rt.scale;
-            int bx1 = std::min(bx0 + rt.scale, rt.winW);
-            int by1 = std::min(by0 + rt.scale, rt.winH);
-            for (int by = by0; by < by1; ++by) {
-                uint8_t* row = &S.display[(size_t(by) * rt.winW + bx0) * 3];
-                for (int bx = bx0; bx < bx1; ++bx) {
-                    *row++ = r8; *row++ = g8; *row++ = b8;
-                }
-            }
+            for (int j = 0; j < n; ++j) shade(idxs[j], x + j, y, lam[j], rad[j]);
         }
     }
     S.samplesTraced.fetch_add(traced, std::memory_order_relaxed);

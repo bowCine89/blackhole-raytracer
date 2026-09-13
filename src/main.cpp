@@ -15,6 +15,7 @@
 #include "spectrum.hpp"
 #include "scene.hpp"
 #include "render.hpp"
+#include "packet.hpp"
 #include "image.hpp"
 
 #include <atomic>
@@ -72,6 +73,7 @@ struct Config {
     bool  check = false;
     bool  stats = false;
     bool  quiet = false;
+    bool  simd = true;               // 8-wide packet tracing; --no-simd disables
 };
 
 // ---------------------------------------------------------------------------
@@ -287,6 +289,92 @@ static int runChecks() {
                     "Page-Thorne flux vanishes at the ISCO", "", zeroTorque ? "ok" : "FAIL");
     }
 
+    // --- SIMD layer ---------------------------------------------------------
+    // The packet tracer replaces libm sin/cos with its own vector version, so
+    // that has to be held to libm before anything built on it can be trusted.
+    {
+        Rng rng(7, 99);
+        Real worstS = 0, worstC = 0;
+        for (int it = 0; it < 40000; ++it) {
+            vd x;
+            double xs[LANES];
+            for (int i = 0; i < LANES; ++i) { xs[i] = rng.uniform() * PI; x[i] = xs[i]; }
+            vd s, c;
+            vsincos(x, s, c);
+            for (int i = 0; i < LANES; ++i) {
+                worstS = std::max(worstS, std::fabs(s[i] - std::sin(xs[i])));
+                worstC = std::max(worstC, std::fabs(c[i] - std::cos(xs[i])));
+            }
+        }
+        Real worst = std::max(worstS, worstC);
+        bool ok = worst < 4e-15;
+        if (!ok) ++failures;
+        std::printf("  %-46s %14.3e  (tolerance %9.1e)              %s\n",
+                    "vsincos vs libm over theta in (0,pi)", worst, 4e-15, ok ? "ok" : "FAIL");
+    }
+
+    // --- packet tracer against the scalar tracer ----------------------------
+    // Identical rays down both paths.  Monte Carlo is not involved: this
+    // compares the geodesic flow itself, which is the part that was rewritten.
+    {
+        Kerr k(0.94);
+        Disk d;
+        d.turbulence = 0;
+        d.init(k, -1, 18.0);
+        Propagator prop;
+        prop.kerr = &k; prop.disk = &d;
+        prop.rEscape = 2000;
+        prop.rCapture = std::max(k.horizon() * 1.0005, std::min(k.photonOrbit(true), d.rIn));
+        prop.rtol = 1e-6;
+        prop.maxSteps = 60000;
+
+        CameraParams cp;
+        Camera cam(k, cp);
+
+        const int N = 4096;
+        int mismatches = 0, compared = 0;
+        Real worstRel = 0;
+
+        for (int base = 0; base < N; base += LANES) {
+            Geodesic gp[LANES];
+            bool act[LANES];
+            State scalarEnd[LANES];
+            Term  scalarTerm[LANES];
+            for (int j = 0; j < LANES; ++j) {
+                int idx = base + j;
+                Real sx = -0.95 + 1.9 * ((idx * 37) % 64) / 63.0;
+                Real sy = -0.95 + 1.9 * ((idx * 91) % 64) / 63.0;
+                gp[j] = cam.ray(sx, sy);
+                act[j] = true;
+                scalarTerm[j] = prop.run(gp[j], scalarEnd[j]);
+            }
+            PacketResult res;
+            runPacket(k, d, prop, gp, act, res);
+
+            for (int j = 0; j < LANES; ++j) {
+                ++compared;
+                if (res.term[j] != scalarTerm[j]) { ++mismatches; continue; }
+                // Same outcome: the end states should agree closely too.
+                Real den = std::max<Real>(1.0, std::fabs(scalarEnd[j].y[0]));
+                Real rel = std::fabs(res.yEnd[j].y[0] - scalarEnd[j].y[0]) / den;
+                worstRel = std::max(worstRel, rel);
+            }
+        }
+        Real mismatchFrac = Real(mismatches) / compared;
+        // A handful of rays graze the photon ring, where the trajectory is
+        // chaotic and a 1e-15 difference in sin() is enough to flip capture
+        // into escape.  That is physics, not a porting error, so a small
+        // fraction is expected; a systematic bug would show up in the hundreds.
+        bool ok = mismatchFrac < 0.01 && worstRel < 1e-6;
+        if (!ok) ++failures;
+        std::printf("  %-46s %13.4f%%  (%d of %d rays)                 %s\n",
+                    "packet vs scalar: outcome disagreements",
+                    100.0 * mismatchFrac, mismatches, compared, ok ? "ok" : "FAIL");
+        std::printf("  %-46s %14.3e  (tolerance %9.1e)              %s\n",
+                    "packet vs scalar: max rel. difference in r", worstRel, 1e-6,
+                    worstRel < 1e-6 ? "ok" : "FAIL");
+    }
+
     std::printf("------------------------------\n");
     std::printf("%s (%d failure%s)\n", failures ? "FAILED" : "ALL CHECKS PASSED",
                 failures, failures == 1 ? "" : "s");
@@ -395,6 +483,8 @@ int main(int argc, char** argv) {
         else if (s == "--check")       c.check = true;
         else if (s == "--quiet")       c.quiet = true;
         else if (s == "--stats")       c.stats = true;
+        else if (s == "--simd")        c.simd = true;
+        else if (s == "--no-simd")     c.simd = false;
         else if (s == "--help" || s == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", s.c_str()); usage(); return 2; }
     }
@@ -490,19 +580,50 @@ int main(int argc, char** argv) {
                     Real rx = rng.uniform(), ry = rng.uniform(), rl = rng.uniform();
                     Vec3 xyz{0, 0, 0};
 
-                    for (int s = 0; s < c.spp; ++s) {
+                    // The sample index fully determines the ray, so the two
+                    // paths below differ only in how many are in flight at once.
+                    auto sampleOf = [&](int s, Real& lambda, Real& sx, Real& sy) {
                         Real u1 = rx + 0.7548776662 * (s + 1); u1 -= std::floor(u1);
                         Real u2 = ry + 0.5698402910 * (s + 1); u2 -= std::floor(u2);
                         Real ul = rl + (s + 0.5) / c.spp;      ul -= std::floor(ul);
+                        lambda = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
+                        sx = 2.0 * (x + u1) / W - 1.0;
+                        sy = 1.0 - 2.0 * (y + u2) / H;
+                    };
 
-                        Real lambda = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
-                        Real sx = 2.0 * (x + u1) / W - 1.0;
-                        Real sy = 1.0 - 2.0 * (y + u2) / H;
-
-                        Geodesic g = cam.ray(sx, sy);
-                        Real L = tracePath(kerr, disk, sky, prop, g, lambda, rng, c.maxBounces, &localSteps);
-                        if (L > 0) xyz += spec::cieXYZ(lambda) * L;
-                        ++localRays;
+                    if (c.simd) {
+                        // Eight samples of this pixel travel together.  They
+                        // differ only by sub-pixel jitter and wavelength, and
+                        // wavelength does not enter the geodesic at all, so the
+                        // eight trajectories stay tightly coherent.
+                        for (int s = 0; s < c.spp; s += LANES) {
+                            int n = std::min(LANES, c.spp - s);
+                            Geodesic gp[LANES];
+                            Real lam[LANES];
+                            Rng  rgs[LANES];
+                            for (int j = 0; j < n; ++j) {
+                                Real sx, sy;
+                                sampleOf(s + j, lam[j], sx, sy);
+                                gp[j] = cam.ray(sx, sy);
+                                rgs[j] = Rng(uint64_t(y) * W + x + 1,
+                                             c.seed + uint64_t(s + j) * 0x9E3779B97F4A7C15ull);
+                            }
+                            Real rad[LANES];
+                            tracePacket(kerr, disk, sky, prop, gp, lam, rgs,
+                                        c.maxBounces, n, rad, &localSteps);
+                            for (int j = 0; j < n; ++j)
+                                if (rad[j] > 0) xyz += spec::cieXYZ(lam[j]) * rad[j];
+                            localRays += uint64_t(n);
+                        }
+                    } else {
+                        for (int s = 0; s < c.spp; ++s) {
+                            Real lambda, sx, sy;
+                            sampleOf(s, lambda, sx, sy);
+                            Geodesic g = cam.ray(sx, sy);
+                            Real L = tracePath(kerr, disk, sky, prop, g, lambda, rng, c.maxBounces, &localSteps);
+                            if (L > 0) xyz += spec::cieXYZ(lambda) * L;
+                            ++localRays;
+                        }
                     }
 
                     Real inv = lamScale / c.spp;

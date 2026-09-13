@@ -94,10 +94,10 @@ r             reset camera                         s       save a PNG
 
 ### Why it has two regimes
 
-One number forces the whole design. At ~2.9 Mrays/s a 33 ms frame buys about
-**96k samples**, while a 1280×720 window has **921k pixels**. Full resolution
-cannot deliver even a *tenth* of a sample per pixel inside an interactive frame,
-so the viewer switches between:
+One number forces the whole design. Even at 12 Mrays/s a 33 ms frame buys about
+**400k samples**, while a 1280×720 window has **921k pixels**. Full resolution
+still cannot deliver one sample per pixel inside an interactive frame, so the
+viewer switches between:
 
 | | resolution | samples | what you see |
 |---|---|---|---|
@@ -117,13 +117,18 @@ bounce count rather than assuming a fixed cost. Measured on the 16-core machine
 at 1280×720, target 30 fps:
 
 ```
-  moving    scale 1/4   render 320x180    ui 60 fps   first-pass 44 Hz
-  settled   scale 1/1   render 1280x720   ui 60 fps   1 -> 10 spp in 4 s
+  moving    scale 1/2   render 640x360    ui 60 fps   first-pass 45 Hz
+  settled   scale 1/1   render 1280x720   ui 60 fps   6 -> 46 spp in 3 s
 ```
 
-The first-pass rate lands above the 30 Hz target because $s$ is a ceiling: $s=3$
-would have given 27 Hz, just under. The ceiling guarantees the target rather
-than averaging it.
+The first-pass rate lands above the 30 Hz target because $s$ is a ceiling, which
+guarantees the target rather than averaging it.
+
+Those figures are with packet tracing, and the adaptive scale picked the
+speedup up on its own: the same formula that chose 1/4 resolution against the
+scalar backend now chooses **1/2 — four times the pixels at the same frame
+rate** — while settled convergence went from 10 spp to 46 spp in three seconds.
+Nothing in the viewer was retuned for it.
 
 ### Concurrency
 
@@ -178,8 +183,8 @@ throughput behind it: geodesic integration near the photon ring genuinely needs
 64-bit floats, and consumer parts typically run FP64 at a small fraction of
 their FP32 rate.
 
-The speed here comes from threads and from cutting work, **not** from vector
-width — see the [ISA measurements](#the-code-does-not-use-avx-512-measured).
+Speed comes from three places, in order of size: putting eight rays in SIMD
+lanes, threads, and cutting work. See [Performance](#performance).
 
 ---
 
@@ -538,23 +543,82 @@ alone costs $\sim 10^{-10}$ of that per evaluation.
 
 ## Performance
 
-16-core / 32-thread Zen 5 (Ryzen 9 9950X), 640×360 at 32 spp, default settings:
+16-core / 32-thread Zen 5 (Ryzen 9 9950X), 640×360 at 32 spp, default settings.
+
+**11.3 Mrays/s**, from 1.03 where this started. The 1920×1080 hero image at
+384 spp takes **58 s**, down from 266 s.
+
+### Packet tracing: eight rays per lane
+
+The single largest win, and the one that needed the most machinery. A single
+ray's Dormand–Prince stages are strictly sequential — each right-hand side waits
+on the previous one's `sincos` and divide — so scalar tracing sits at ~850
+cycles per step with the FPU mostly idle. Nothing about *one* ray fixes that.
+Eight independent rays in eight lanes do, because their dependency chains are
+unrelated.
+
+| | Mrays/s | steps/ray | speedup |
+|---|--:|--:|--:|
+| scalar | 2.95 | 60 | 1.0× |
+| 2 lanes | 4.96 | 66 | 1.7× |
+| 4 lanes | 8.04 | 72 | 2.7× |
+| **8 lanes** | **11.41** | 78 | **3.9×** |
+
+Per-step throughput went from 179 to 1078 Msteps/s — **6.0×**, against a
+theoretical ceiling of 8. The gap is lane divergence: a packet runs until *every*
+lane has terminated, so it does `max` steps rather than each ray's own, which is
+the 60 → 78 steps/ray column. Eight lanes still wins despite carrying the most
+waste, so the extra width more than pays for the divergence.
+
+Coherence is free here. A packet is eight samples of the **same pixel**,
+differing only by sub-pixel jitter and wavelength — and wavelength does not enter
+the geodesic at all, only the emission — so the eight trajectories stay tightly
+together. (The viewer packs eight *adjacent pixels* instead, for the same
+reason.)
+
+Two pieces had to be built: an SoA integrator where a lane that rejects a step,
+hits the disk or crosses the horizon is handled by a mask instead of a branch;
+and a vectorised `sincos`, since there is no vector libm here. Cody–Waite
+reduction plus Taylor series gets within **1.1e-15** of libm, verified in
+`--check`.
+
+`--no-simd` runs the scalar path, which is kept as the reference.
+
+### What vector width actually buys
+
+The earlier version of this file claimed the code could not use AVX-512. That
+was true of *scalar* tracing and is now obsolete — but the follow-up is not what
+was predicted:
+
+| build | scalar | 8-wide packet |
+|---|--:|--:|
+| SSE2 only (`-mno-avx -mno-fma`) | 2.54 | 4.05 |
+| AVX2 (`-mno-avx512f`) | 2.93 | 11.33 |
+| AVX-512 (`-march=native`) | 2.83 | 11.41 |
+
+Vectorising was worth **2.8×** (SSE2 → AVX2). **AVX-512 specifically adds
+~1%**, inside the noise. Eight lanes still beat four, but on AVX2 that is two
+256-bit registers in flight rather than one 512-bit one — so the win is having
+eight rays in flight, not the wider register. The prediction that this needed
+AVX-512 was wrong; it needed *vectorisation*, and 256-bit hardware captures
+essentially all of it.
+
+### Threads
 
 | threads | time | Mrays/s |
 |--------:|-----:|--------:|
-| 1 | 51.3 s | 0.14 |
-| 2 | 25.8 s | 0.29 |
-| 4 | 13.2 s | 0.56 |
-| 8 | 7.0 s | 1.05 |
-| 16 | 3.8 s | 1.92 |
-| 32 | 2.6 s | 2.87 |
+| 1 | 10.8 s | 0.68 |
+| 4 | 2.8 s | 2.61 |
+| 16 | 0.90 s | 8.21 |
+| 31 | 0.65 s | 11.31 |
 
-**20× on 16 cores + SMT**, 13.4× on the physical cores alone. Work is handed out
-as 16×16 tiles from an atomic counter, so the expensive pixels — rays that wind
-near the photon ring — do not stall a whole row. The 1920×1080 hero image at
-384 spp takes 266 s: 796M rays at 3.00 Mrays/s, 60 integration steps per ray.
+**16.6× on 16 cores + SMT.** Work is handed out as 16×16 tiles from an atomic
+counter, so the expensive pixels — rays that wind near the photon ring — do not
+stall a whole row.
 
-Tuning took it from 1.03 to ~2.9 Mrays/s:
+### Earlier scalar tuning
+
+Before packet tracing, these took it from 1.03 to ~2.9 Mrays/s:
 
 | change | effect |
 |---|---|
@@ -565,33 +629,31 @@ Tuning took it from 1.03 to ~2.9 Mrays/s:
 
 Every tolerance claim above was checked by diffing HDR buffers, not by eye.
 
-### The code does not use AVX-512 (measured)
+### Is the packet path actually the same tracer?
 
-`-march=native` is worth keeping, but **FMA earns it, not vector width**:
+Two tests, in `--check`:
 
-| build | Mrays/s |
-|---|--:|
-| SSE2 only (`-mno-avx -mno-fma`) | 2.54 |
-| `-march=native` | 2.90 |
-| `-march=native -mno-avx512f` | 2.95 |
+- **`vsincos` against libm** over the θ range the tracer uses: max absolute
+  error **1.1e-15**, and the Cody–Waite reduction holds to the same figure over
+  [-200, 200], so it is not merely correct near the fold.
+- **Packet against scalar on identical rays.** 4096 camera rays down both paths,
+  with Monte Carlo taken out of the picture entirely, comparing where each ray
+  ended up: **0 outcome disagreements**, and a maximum relative difference in
+  final radius of **8e-12**. The packet tracer is not statistically equivalent
+  to the scalar one, it is numerically equivalent.
 
-Turning AVX-512 off changes nothing. Disassembly shows why:
-`DormandPrince::trial`, where nearly all the time goes, contains **zero** `zmm`
-and `ymm` registers — 285 scalar-double instructions (`vmulsd`, `vfmadd231sd`,
-`vdivsd`) against 68 packed. The `zmm` occurrences elsewhere are in cold code
-such as image post-processing.
+At the image level, packet and scalar use different random streams, so they are
+compared the way the disk-edge change was: their difference is **9× smaller than
+the noise floor** measured between two seeds of the same build (3.3% against
+29.7% mean), with image means agreeing to 0.16%.
 
-This is the expected result, and it is the same fact as the latency analysis: at
-~850 cycles per step the code is *latency*-bound, because one ray's
-Dormand–Prince stages are strictly sequential — each right-hand side waits on
-the previous one's `sincos` and divide. There is nothing for the compiler to
-pack into a wide register.
+### Where the remaining headroom is
 
-**Where the remaining headroom is.** Vector width can only be exploited by
-putting *different rays* in different lanes: packet tracing, 8 rays per thread in
-AVX-512 lanes with per-lane masks. It needs an SoA integrator and a vectorised
-`sincos`, and rays within a pixel are coherent enough that lane divergence
-should stay low.
+Divergence is now the visible cost: 78 steps per ray against the 60 a scalar
+trace needs, because a packet cannot retire until its slowest lane does.
+Refilling finished lanes with fresh rays instead of idling them would recover
+most of that — worth roughly 1.3× if it were free, less in practice once the
+compaction is paid for.
 
 ---
 
@@ -603,7 +665,7 @@ Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
 Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
 Sky       --sky-gain --star-density --band --nostars
 Tone map  --exposure --key --bloom --desat
-Accuracy  --rtol --max-steps
+Accuracy  --rtol --max-steps --no-simd
 Other     --preview --check --stats --quiet --help
 ```
 
@@ -656,7 +718,9 @@ src/kerr.hpp      Kerr metric, geodesic RHS, Dormand-Prince, tetrads
 src/scene.hpp     Novikov-Thorne disk, optical-depth edge, star field
 src/spectrum.hpp  Planck, CIE 1931, sRGB, ACES
 src/image.hpp     PNG / PPM / PFM writers (no libraries)
-src/render.hpp    propagation, path tracing, camera -- shared by both front ends
+src/simd.hpp      8-wide vector types, vectorised sincos and fifth root
+src/packet.hpp    SoA Dormand-Prince and packet path tracing
+src/render.hpp    scalar propagation and path tracing, camera -- the reference
 src/main.cpp      batch renderer: threading, tone mapping, CLI, self-test
 src/viewer.cpp    SDL2 viewer: progressive pipeline, camera controls
 ```
