@@ -87,12 +87,19 @@ refining for as long as you leave it alone.
 left drag     orbit (inclination and azimuth)      [ / ]   spin a/M
 right drag    pan the aim point                    , / .   disk outer radius
 wheel         dolly in/out                         - / =   exposure
-space         play / pause disk rotation           k / l   time scale
-t             reset time to zero
 ctrl+wheel    field of view                        b       scattering bounces
 r             reset camera                         s       save a PNG
                                                    esc/q   quit
 ```
+
+The viewer shows a **single instant**; the disk does not turn here. That is
+deliberate, and the reason is arithmetic rather than effort: a rotating disk
+changes faster than the tracer converges, so an animating viewer is pinned at
+one sample per pixel forever and can never settle. Progressive refinement and
+animation are directly at odds. Rotation therefore lives in the batch renderer,
+where each frame is taken to full convergence before time advances — see
+[Offline animation](#offline-animation). `--time T` selects which instant the
+viewer shows.
 
 ### Why it has two regimes
 
@@ -134,23 +141,13 @@ Nothing in the viewer was retuned for it.
 
 ### Making one sample per pixel watchable
 
-Four things had to be fixed before an animating disk looked like anything. The
-first was simply a bug, and the one that made it look stalled:
+Three things had to be fixed before one sample per pixel was watchable at all —
+the regime the viewer is in whenever the camera is moving.
 
-**The animation clock measured the wrong interval.** It read `since(lastFrame)`,
-but `lastFrame` is stamped at the *end* of the previous frame, so the interval
-was the loop tail — a few hundred microseconds — rather than a whole frame. The
-disk advanced at about **0.06 M/s instead of the configured 6**, a hundredfold
-too slow, which at a 24 M orbital period means seven minutes per revolution. It
-was rotating; it just was not arriving. The clock now has its own timestamp
-sampled at the same point each frame, verified by watching $t$ reach 29 M after
-five seconds at 6 M/s.
-
-**A pass has to finish before the scene is allowed to change.** The display loop
-runs at 60 Hz while a full pass completes at about 40, so resetting the
-accumulator every frame wiped it before any pass had finished. Coverage sat
-permanently at **53%**: half the frame current, half leftovers, never resolving —
-which reads exactly as a stall. Scene changes are now *coalesced* and applied
+**A pass has to finish before the scene is allowed to change.** Dragging changes
+the scene on every display frame, faster than a pass completes, so resetting the
+accumulator each time wiped it before any pass had finished.  Coverage sat at
+**53%**: half the frame current, half leftovers, never resolving. Scene changes are now *coalesced* and applied
 only once the current pass has completed, so every image shown is a complete
 render of one state, at a cost of at most one pass of input latency (~25 ms).
 Publishing the camera at that moment also closed a real data race: it used to be
@@ -189,9 +186,9 @@ shown again, so convergence stays visible.
 **The present loop must not block on vsync.** A capped pass can finish part way
 through a display interval, and if publication waits for the next vsync every
 worker idles until then: measured at **a third** of total throughput, which the
-adaptive scale then pays for in resolution (1/3 instead of 1/2). Polling fast
-and presenting on a timer recovers it — 6.15 → **7.7 Mrays/s** while animating,
-at 640×360 instead of 427×240.
+adaptive scale then pays for in resolution. Polling fast and presenting on a
+timer recovers it — 6.15 to **7.7 Mrays/s** while the camera is moving, at
+640x360 instead of 427x240.
 
 ### Exposure
 
@@ -484,18 +481,37 @@ pins the *rate*: a ring must return to exactly its starting state after one
 period $2\pi/\Omega(r)$ — it closes to **6e-16** — and must differ half a period
 in, which it does.
 
+#### Offline animation
+
+Rotation is a **batch** feature, not an interactive one, and that is a
+consequence rather than a limitation. A turning disk changes faster than the
+path tracer converges: a frame worth looking at needs tens of samples per pixel,
+which takes far longer than the interval over which the disk visibly moves. An
+animating viewer is therefore stuck at one sample per pixel indefinitely.
+Offline the ordering is reversed — converge, *then* advance the clock:
+
+```powershell
+.\kerr.exe --frames 120 --spp 256 --inc 30 --out out/spin.png
+```
+
+writing `spin-0000.png` … `spin-0119.png`, each fully converged, with a running
+estimate of the time remaining. `--tstep` sets the interval in $M$; left alone
+it spreads the sequence across exactly one ISCO orbital period, which is the
+natural unit — the innermost ring returns to where it started while the outer
+disk has barely moved.
+
+A caveat worth stating: **the sequence cannot loop seamlessly**, and no choice
+of step makes it. Differential rotation means every radius has its own period —
+24 M at the ISCO against 420 M at $r = 16M$ — so there is no time at which the
+whole disk simultaneously returns to its initial state. That is the physics
+being right, not the renderer being careless.
+
 **On "the right speed" in wall-clock terms.** There isn't one: it depends
 entirely on the mass. $24M$ at the ISCO is 1.2 ms for a 10 $M_\odot$ hole, about
 8 minutes for Sgr A\*, and roughly 9 days for M87\*. What physics fixes is the
 *ratio* of rates between radii, which is what the code gets right; the absolute
-rate is a playback choice. `--timescale` in the viewer sets how much coordinate
-time passes per second of wall clock, defaulting to 6 M/s so one inner orbit
-takes about four seconds. `--time T` renders a single instant, so a sequence is
-just a loop:
-
-```powershell
-0..119 | % { .\kerr.exe --quiet --time ($_ * 0.4) --out ("frame{0:d3}.png" -f $_) }
-```
+rate — how much coordinate time one frame of playback represents — is yours to
+choose with `--tstep`.
 
 ### 5. Emission and relativistic transfer
 
@@ -825,7 +841,8 @@ compaction is paid for.
 ```
 Image     --width --height --spp --bounces --threads --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
-Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau --time
+Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
+Animation --time --frames --tstep
 Sky       --sky-gain --star-density --band --nostars
 Tone map  --exposure --key --bloom --desat
 Accuracy  --rtol --max-steps --no-simd

@@ -75,6 +75,8 @@ struct Config {
     bool  quiet = false;
     bool  simd = true;               // 8-wide packet tracing; --no-simd disables
     Real  tObs = 0.0;                // observer coordinate time, in M
+    int   frames = 1;                // >1 renders a sequence
+    Real  tStep = -1;                // M between frames; <0 = one ISCO orbit/frames
 };
 
 // ---------------------------------------------------------------------------
@@ -551,6 +553,8 @@ int main(int argc, char** argv) {
         else if (s == "--simd")        c.simd = true;
         else if (s == "--no-simd")     c.simd = false;
         else if (s == "--time")        c.tObs = needF(i);
+        else if (s == "--frames")      c.frames = needI(i);
+        else if (s == "--tstep")       c.tStep = needF(i);
         else if (s == "--help" || s == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", s.c_str()); usage(); return 2; }
     }
@@ -614,6 +618,32 @@ int main(int argc, char** argv) {
                     c.width, c.height, c.spp, c.maxBounces, c.maxBounces == 1 ? "" : "s", nThreads);
         std::fflush(stdout);
     }
+
+    // --- frame sequence ----------------------------------------------------
+    //
+    // Rotation belongs here rather than in the viewer: a turning disk changes
+    // faster than the tracer converges, so interactively it could never settle.
+    // Offline each frame is taken to full convergence before time advances.
+    //
+    // The default step covers exactly one ISCO orbital period across the whole
+    // sequence, which is the natural unit -- the innermost ring returns to where
+    // it began, while the outer disk has barely moved.
+    Real tStep = c.tStep;
+    if (tStep < 0) {
+        Real periodIsco = TWO_PI / disk.orbitOmega(kerr.isco(true));
+        tStep = periodIsco / std::max(1, c.frames);
+    }
+    if (!c.quiet && c.frames > 1) {
+        std::printf("  sequence          %d frames, %.3f M apart (ISCO period %.1f M)\n",
+                    c.frames, double(tStep), double(TWO_PI / disk.orbitOmega(kerr.isco(true))));
+        std::fflush(stdout);
+    }
+
+    const Real tStart = c.tObs;
+    auto seqStart = std::chrono::steady_clock::now();
+
+    for (int frame = 0; frame < std::max(1, c.frames); ++frame) {
+        c.tObs = tStart + tStep * frame;
 
     // --- render -----------------------------------------------------------
     const int W = c.width, H = c.height;
@@ -772,7 +802,18 @@ int main(int argc, char** argv) {
         rgb[i * 3 + 2] = float(std::max<Real>(0, v.z));
     }
 
-    if (c.writePfm) img::writePfm(c.out + ".pfm", W, H, rgb);
+    // A sequence numbers its frames; a single render keeps the name given.
+    std::string outPath = c.out;
+    if (c.frames > 1) {
+        std::string base = c.out, ext = ".png";
+        size_t dot = base.find_last_of('.');
+        if (dot != std::string::npos) { ext = base.substr(dot); base = base.substr(0, dot); }
+        char suffix[32];
+        std::snprintf(suffix, sizeof suffix, "-%04d", frame);
+        outPath = base + suffix + ext;
+    }
+
+    if (c.writePfm) img::writePfm(outPath + ".pfm", W, H, rgb);
 
     // --- bloom -------------------------------------------------------------
     if (c.bloom > 0) {
@@ -796,10 +837,22 @@ int main(int argc, char** argv) {
         out8[i * 3 + 2] = uint8_t(clampf(spec::srgbEncode(b) * 255.0 + 0.5, 0, 255));
     }
 
-    if (!img::writePng(c.out, W, H, out8)) {
-        std::fprintf(stderr, "failed to write %s\n", c.out.c_str());
+    if (!img::writePng(outPath, W, H, out8)) {
+        std::fprintf(stderr, "failed to write %s\n", outPath.c_str());
         return 1;
     }
-    if (!c.quiet) std::printf("  wrote            %s\n", c.out.c_str());
+    if (!c.quiet) {
+        if (c.frames > 1) {
+            double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - seqStart).count();
+            double eta = elapsed / (frame + 1) * (c.frames - frame - 1);
+            std::printf("  wrote            %s   t = %.2f M   [%d/%d, %.0f s remaining]\n",
+                        outPath.c_str(), double(c.tObs), frame + 1, c.frames, eta);
+        } else {
+            std::printf("  wrote            %s\n", outPath.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    }   // end frame loop
     return 0;
 }
