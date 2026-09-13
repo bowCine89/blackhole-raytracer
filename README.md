@@ -296,6 +296,14 @@ becomes **transparent**, so stars and the disk's own far side show through it.
 As $\tau \to \infty$ this collapses exactly to the opaque disk, and `--edge 0`
 recovers the hard edge.
 
+| `--edge 0` — hard cut | default `--edge 1.2` — optical-depth taper |
+|---|---|
+| ![hard edge](out/edge-hard.png) | ![soft edge](out/edge-soft.png) |
+
+Left, the disk ends on a crisp boundary — nothing in the physics puts an edge
+there. Right, the rim dims and thins out, and the star field shows through it.
+Both were rendered with identical settings apart from `--edge`.
+
 A ray crossing at a grazing angle passes through more material:
 
 $$
