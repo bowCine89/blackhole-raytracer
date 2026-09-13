@@ -102,10 +102,10 @@ coordinates:
 
 $$
 ds^2 = -\left(1 - \frac{2Mr}{\Sigma}\right)dt^2
- - \frac{4Mar\sin^2\theta}{\Sigma}\,dt\,d\phi
- + \frac{\Sigma}{\Delta}\,dr^2
- + \Sigma\,d\theta^2
- + \frac{A\sin^2\theta}{\Sigma}\,d\phi^2
+-\frac{4Mar\sin^2\theta}{\Sigma}\,dt\,d\phi
++\frac{\Sigma}{\Delta}\,dr^2
++\Sigma\,d\theta^2
++\frac{A\sin^2\theta}{\Sigma}\,d\phi^2
 $$
 
 with
@@ -149,8 +149,8 @@ rescaled quantity
 $$
 F \equiv \Sigma\, g^{\mu\nu}p_\mu p_\nu
 = \Delta p_r^2 + p_\theta^2
-+ \frac{\left(L - aE\sin^2\theta\right)^2}{\sin^2\theta}
-- \frac{\left[E(r^2+a^2) - aL\right]^2}{\Delta},
++\frac{\left(L - aE\sin^2\theta\right)^2}{\sin^2\theta}
+-\frac{\left[E(r^2+a^2) - aL\right]^2}{\Delta},
 $$
 
 which vanishes identically on a null geodesic. Integrating in **Mino time**,
@@ -204,7 +204,7 @@ the Page & Thorne (1974) flux is
 $$
 F(r) \propto \frac{1}{x^4\left(x^3 - 3x + 2a_\star\right)}
 \left[\, x - x_0 - \frac{3}{2}a_\star\ln\frac{x}{x_0}
-- \sum_{i=1}^{3}\frac{3\left(x_i - a_\star\right)^2}{x_i\left(x_i-x_j\right)\left(x_i-x_k\right)}
+-\sum_{i=1}^{3}\frac{3\left(x_i - a_\star\right)^2}{x_i\left(x_i-x_j\right)\left(x_i-x_k\right)}
 \ln\frac{x - x_i}{x_0 - x_i}\right]
 $$
 
@@ -430,8 +430,8 @@ series
 
 $$
 \alpha = \frac{4M}{b} + \frac{15\pi}{4}\left(\frac{M}{b}\right)^{2}
-+ \frac{128}{3}\left(\frac{M}{b}\right)^{3}
-+ \mathcal{O}\!\left(\left(\frac{M}{b}\right)^{4}\right),
++\frac{128}{3}\left(\frac{M}{b}\right)^{3}
++\mathcal{O}\!\left(\left(\frac{M}{b}\right)^{4}\right),
 $$
 
 matching to $8\times10^{-5}$. This exercises the integrator *and* the
