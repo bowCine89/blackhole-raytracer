@@ -18,6 +18,26 @@ samples a wide swathe of sky:
 
 ![lensing](out/lensing.png)
 
+### The looping orbit
+
+**[`kerr-orbit.avi`](kerr-orbit.avi)** — one full ISCO orbital period, 96 frames
+at 1280×720, each converged to 128 samples per pixel with 2 scattering bounces.
+Four seconds at 24 fps, and it loops: the last frame runs back into the first
+with no seam. Stored uncompressed (253 MB, via Git LFS) because every frame took
+seconds to converge and there was no case for throwing that away on the way to
+disk — GitHub will not preview it, so download it and play it locally.
+
+That the loop closes at all is not a matter of picking the right duration;
+differential rotation makes that impossible. See
+[Making the loop close](#making-the-loop-close) for what it actually takes, and
+for the measurements.
+
+It was produced by:
+
+```powershell
+.\kerr.exe --frames 96 --orbits 1 --loop --spp 128 --video kerr-orbit.avi --no-png
+```
+
 ---
 
 ## The models at a glance
@@ -564,6 +584,9 @@ so the sequence is never held in memory. The cost is size: $1280\times720\times3
 bytes a frame, about 265 MB for a 96-frame loop. Transcode afterwards if
 something smaller is wanted; the other direction is not available. `--fps` sets
 the playback rate stamped into the header, and `--no-png` keeps only the video.
+
+[`kerr-orbit.avi`](kerr-orbit.avi) in the repository root is exactly this
+command's output, kept in Git LFS.
 
 #### Making the loop close
 
