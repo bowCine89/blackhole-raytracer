@@ -100,10 +100,17 @@ struct Shared {
     // one taken simply drops that work item.
     std::unique_ptr<std::atomic<uint8_t>[]> tileBusy;
 
+    // Tiles are visited in a fixed shuffled order rather than raster order.  A
+    // partial pass then covers the frame uniformly instead of filling from the
+    // top, which both makes the refinement read evenly and -- the reason it was
+    // added -- lets the exposure meter trust a partly drawn frame.
+    std::vector<int> tileOrder;
+
     std::atomic<uint64_t> work{0};          // monotonic work counter
     std::atomic<uint64_t> samplesTraced{0};
     std::atomic<double>   exposure{1.0};
     std::atomic<uint32_t> minCount{0};      // samples per pixel, for the title
+    double meterCovered = 0, meterAnchor = 0, meterTarget = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -210,7 +217,7 @@ static void workerLoop(Shared& S) {
         // them once activeWorkers has fallen to zero, which cannot happen
         // while we are counted.
         uint64_t w = S.work.fetch_add(1, std::memory_order_relaxed);
-        int      tile = int(w % uint64_t(S.numTiles));
+        int      tile = S.tileOrder[size_t(w % uint64_t(S.numTiles))];
         uint64_t samp = w / uint64_t(S.numTiles);
         // Claim the tile.  If another worker is a full pass behind and still
         // inside this tile, drop the work item rather than race it; the only
@@ -260,6 +267,16 @@ static void resetAccumulation(Shared& S) {
     S.numTiles = std::max(1, S.tilesX * S.tilesY);
     S.tileBusy = std::make_unique<std::atomic<uint8_t>[]>(size_t(S.numTiles));
 
+    S.tileOrder.resize(size_t(S.numTiles));
+    for (int i = 0; i < S.numTiles; ++i) S.tileOrder[i] = i;
+    {   // deterministic shuffle, so runs stay reproducible
+        Rng shuf(1234, 5678);
+        for (int i = S.numTiles - 1; i > 0; --i) {
+            int j = int(shuf.uniform() * (i + 1));
+            std::swap(S.tileOrder[i], S.tileOrder[j <= i ? j : i]);
+        }
+    }
+
     S.accum.assign(size_t(rt.rw) * rt.rh * 3, 0.0);
     S.count.assign(size_t(rt.rw) * rt.rh, 0u);
     S.work.store(0, std::memory_order_relaxed);
@@ -272,27 +289,87 @@ static void resetAccumulation(Shared& S) {
 // workers write is a benign race: these are statistics, and an 8-byte aligned
 // double load cannot tear on x86-64.  Smoothed over time so the picture does
 // not pulse while samples arrive.
-static double updateExposure(Shared& S, double key, double userExposure, double smoothed) {
+// Percentile of the luminance currently in the accumulator, plus how much of
+// the frame that percentile was actually drawn from.
+static double meterAccumulator(Shared& S, double& coverage) {
     const Target& rt = S.rt;
     static std::vector<double> lum;
     lum.clear();
     size_t n = size_t(rt.rw) * rt.rh;
     size_t stride = std::max<size_t>(1, n / 20000);
+    size_t probed = 0;
     for (size_t i = 0; i < n; i += stride) {
+        ++probed;
         if (S.count[i] == 0) continue;
         lum.push_back(S.accum[i * 3 + 1] / S.count[i]);
     }
-    if (lum.empty()) return smoothed;
-    size_t k = std::min(lum.size() - 1, size_t(lum.size() * 0.995));
+    coverage = probed ? double(lum.size()) / double(probed) : 0.0;
+    if (lum.empty()) return 0.0;
+    // A slightly lower percentile than the batch renderer uses: at one sample
+    // per pixel the top of the distribution is dominated by outliers.
+    size_t k = std::min(lum.size() - 1, size_t(lum.size() * 0.99));
     std::nth_element(lum.begin(), lum.begin() + k, lum.end());
-    double anchor = lum[k];
-    if (!(anchor > 0)) return smoothed;
+    return lum[k];
+}
+
+// Exposure is a *ratio*, so it is carried and smoothed in log space.  The old
+// linear form let one bad reading throw it to 1e15 and then took dozens of
+// frames to crawl back, which is what made the first pass after a move glare.
+static double updateExposure(Shared& S, double key, double userExposure, double logSmoothed) {
+    double coverage = 0;
+    double anchor = meterAccumulator(S, coverage);
+    S.meterCovered = coverage;
+    S.meterAnchor = anchor;
+
+    // Never meter from a frame that is barely drawn.  Partial passes used to
+    // produce anchors 5 orders of magnitude too small; holding the last good
+    // reading is strictly better than believing a bad one.
+    if (coverage < 0.25 || !(anchor > 0)) {
+        S.exposure.store(std::exp(logSmoothed) * userExposure, std::memory_order_relaxed);
+        return logSmoothed;
+    }
 
     double target = key / (anchor * S.scene.lamScale);
-    if (smoothed <= 0) smoothed = target;
-    smoothed += (target - smoothed) * 0.25;
-    S.exposure.store(smoothed * userExposure, std::memory_order_relaxed);
-    return smoothed;
+    target = clampf(target, 1e-6, 1e6);
+    S.meterTarget = target;
+
+    double logTarget = std::log(target);
+    if (!(logSmoothed > -1e30 && logSmoothed < 1e30)) logSmoothed = logTarget;   // first reading
+    logSmoothed += (logTarget - logSmoothed) * 0.25;
+    S.exposure.store(std::exp(logSmoothed) * userExposure, std::memory_order_relaxed);
+    return logSmoothed;
+}
+
+// One coarse synchronous pass before anything is displayed, so frame one is
+// already correctly exposed instead of arriving white and settling down.
+static double meterInitial(const Scene& sc, const CameraParams& cam, double key) {
+    Camera c(sc.kerr, cam);
+    const int w = 96, h = 54, spp = 4;
+    std::vector<double> lum;
+    lum.reserve(size_t(w) * h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            double acc = 0;
+            for (int s = 0; s < spp; ++s) {
+                uint32_t hsh = hashCombine(uint32_t(x), uint32_t(y), uint32_t(s) + 1u);
+                Real u1 = hashFloat(hsh), u2 = hashFloat(hashU32(hsh ^ 0x9e3779b9u));
+                Real ul = fract(0.6180339887 * s + hashFloat(hashU32(hsh ^ 0x85ebca6bu)));
+                Rng rng(size_t(y) * w + x + 1, sc.seed + uint64_t(s) * 0x9E3779B97F4A7C15ull);
+                Real lambda = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
+                Real sx = 2.0 * (x + u1) / w - 1.0;
+                Real sy = 1.0 - 2.0 * (y + u2) / h;
+                Geodesic g = c.ray(sx, sy);
+                Real L = tracePath(sc.kerr, sc.disk, sc.sky, sc.prop, g, lambda, rng, sc.maxBounces);
+                if (L > 0) acc += spec::cieXYZ(lambda).y * L;
+            }
+            lum.push_back(acc / spp);
+        }
+    }
+    size_t k = std::min(lum.size() - 1, size_t(lum.size() * 0.99));
+    std::nth_element(lum.begin(), lum.begin() + k, lum.end());
+    double anchor = lum[k];
+    if (!(anchor > 0)) return std::log(1.0);
+    return std::log(clampf(key / (anchor * sc.lamScale), 1e-6, 1e6));
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +503,9 @@ int main(int argc, char** argv) {
     auto  lastStatus = Clock::now();
     uint64_t statSamples = 0;
     double raysPerSec = 2.0e6;          // seeded, corrected after the first second
-    double smoothedExposure = 0.0;
+    // Meter once, coarsely and synchronously, before anything is shown.
+    double logExposure = meterInitial(sc, S.cam, key);
+    S.exposure.store(std::exp(logExposure) * userExposure, std::memory_order_relaxed);
     double fps = 0.0;
     auto  lastFrame = Clock::now();
     bool  running = true;
@@ -434,6 +513,11 @@ int main(int argc, char** argv) {
 
     auto startTime = Clock::now();
     while (running) {
+        // Meter first, on whatever the workers produced since the last reset.
+        // Doing this after the reset below always reads an empty buffer, which
+        // is exactly how the exposure used to end up meaningless while moving.
+        logExposure = updateExposure(S, key, userExposure, logExposure);
+
         bool camChanged = false;
 
         // Scripted motion, so the interactive path can be exercised headlessly.
@@ -598,8 +682,6 @@ int main(int argc, char** argv) {
             statSamples = now;
             lastStats = Clock::now();
         }
-        smoothedExposure = updateExposure(S, key, userExposure, smoothedExposure);
-
         // Cheapest useful progress figure: samples completed per render pixel.
         {
             uint64_t w = S.work.load(std::memory_order_relaxed);
@@ -622,6 +704,8 @@ int main(int argc, char** argv) {
                         "first-pass %.1f Hz  %.2f Mrays/s\n",
                         since(startTime), moving ? "moving" : "settled", S.rt.scale,
                         S.rt.rw, S.rt.rh, S.minCount.load(), fps, passHz, raysPerSec / 1e6);
+            std::printf("           metering: covered %5.1f%%  anchor %.4g  target %.4g  live %.4g\n",
+                        100.0 * S.meterCovered, S.meterAnchor, S.meterTarget, S.exposure.load());
             std::fflush(stdout);
             lastStatus = Clock::now();
         }

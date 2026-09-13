@@ -130,6 +130,39 @@ scalar backend now chooses **1/2 — four times the pixels at the same frame
 rate** — while settled convergence went from 10 spp to 46 spp in three seconds.
 Nothing in the viewer was retuned for it.
 
+### Exposure
+
+Auto-exposure in a progressive renderer is harder than in a batch one, because
+the thing being metered is half-drawn. Three rules, each earned by a bug:
+
+**Meter before the reset, not after.** A camera change clears the accumulator.
+Metering after that reads an empty buffer — and the original code skipped
+uncovered pixels, so it computed a percentile from the handful that happened to
+be drawn. Measured while orbiting, coverage was **0.0%** and the anchor came out
+five orders of magnitude too small. Metering at the top of the frame, on what
+the workers produced since the last reset, gives **100%** coverage instead.
+
+**Meter in log space.** Exposure is a ratio and spans decades, so a linear
+`x += (target - x) * 0.25` lets one bad reading throw it somewhere absurd and
+then crawl back over dozens of frames. It reached **3×10¹⁵**, which is precisely
+what made the first pass after a move arrive white. In log space a bad reading
+cannot do that, and the smoothing is perceptually even besides.
+
+**Meter something complete.** Readings from under 25% coverage are discarded in
+favour of the last good one — a stale exposure beats a wrong one — and tiles are
+now visited in a *shuffled* order rather than raster order, so a partial pass
+covers the frame uniformly instead of filling from the top. That makes a partial
+frame safe to meter, and as a free side effect the image refines evenly rather
+than wiping downward.
+
+Finally, one coarse 96×54 pass runs synchronously at startup, before the window
+is shown, so frame one is already correctly exposed rather than arriving blown
+out and settling. It costs about 30 ms once.
+
+Together these hold the exposure to ±5% while orbiting, and it tracks scene
+brightness over a 100× range: `--tpeak 4000` meters to 2.05, `--tpeak 20000` to
+0.018.
+
 ### Concurrency
 
 Workers never stop. They take items from one monotonic counter, `tile = w mod N`
