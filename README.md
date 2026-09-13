@@ -134,7 +134,17 @@ Nothing in the viewer was retuned for it.
 
 ### Making one sample per pixel watchable
 
-Two things had to be fixed before an animating disk looked like anything.
+Four things had to be fixed before an animating disk looked like anything. The
+first was simply a bug, and the one that made it look stalled:
+
+**The animation clock measured the wrong interval.** It read `since(lastFrame)`,
+but `lastFrame` is stamped at the *end* of the previous frame, so the interval
+was the loop tail — a few hundred microseconds — rather than a whole frame. The
+disk advanced at about **0.06 M/s instead of the configured 6**, a hundredfold
+too slow, which at a 24 M orbital period means seven minutes per revolution. It
+was rotating; it just was not arriving. The clock now has its own timestamp
+sampled at the same point each frame, verified by watching $t$ reach 29 M after
+five seconds at 6 M/s.
 
 **A pass has to finish before the scene is allowed to change.** The display loop
 runs at 60 Hz while a full pass completes at about 40, so resetting the
@@ -165,6 +175,23 @@ carries **four** wavelengths, stratified across the band:
 Measured as the mean chromaticity difference between two seeds at 16 spp: a
 **2.2× reduction**, against the $\sqrt{4} = 2$ the sample count alone would
 predict, for **13%** throughput. The batch renderer gets the same benefit.
+
+**Every displayed frame has to be uniform.** Publishing whatever the workers had
+painted showed a mix of two passes — rectangular patches where some tiles had
+collected a second sample and looked visibly smoother than their neighbours,
+which reads as a broken render rather than as noise. Two changes fix it: while
+moving, dispatch is capped at exactly one item per tile, so no tile can get
+ahead; and the finished pass is copied to a front buffer that the texture is
+uploaded from. Every animated frame is then one sample per pixel at one instant,
+and the grain is even. When settled the cap is lifted and the live buffer is
+shown again, so convergence stays visible.
+
+**The present loop must not block on vsync.** A capped pass can finish part way
+through a display interval, and if publication waits for the next vsync every
+worker idles until then: measured at **a third** of total throughput, which the
+adaptive scale then pays for in resolution (1/3 instead of 1/2). Polling fast
+and presenting on a timer recovers it — 6.15 → **7.7 Mrays/s** while animating,
+at 640×360 instead of 427×240.
 
 ### Exposure
 

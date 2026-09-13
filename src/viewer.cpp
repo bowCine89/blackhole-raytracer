@@ -89,7 +89,8 @@ struct Shared {
 
     std::vector<double>   accum;    // rw*rh*3, CIE XYZ
     std::vector<uint32_t> count;    // rw*rh
-    std::vector<uint8_t>  display;  // winW*winH*3, persists across resets
+    std::vector<uint8_t>  display;  // winW*winH*3, what workers paint into
+    std::vector<uint8_t>  present;  // last *complete* pass, shown while moving
 
     int tilesX = 0, tilesY = 0, numTiles = 1, tileSize = 32;
     int nThreads = 1;
@@ -107,6 +108,13 @@ struct Shared {
     std::vector<int> tileOrder;
 
     std::atomic<uint64_t> work{0};          // monotonic work counter
+
+    // While moving, dispatch is capped at exactly one item per tile.  Without
+    // the cap the counter overshoots between main-thread checks, so some tiles
+    // collect a second sample and appear visibly smoother than their
+    // neighbours -- rectangular patches of differing noise.  0 means no cap,
+    // which is what the settled regime wants.
+    std::atomic<uint64_t> passLimit{0};
     std::atomic<uint64_t> samplesTraced{0};
     std::atomic<double>   exposure{1.0};
     std::atomic<uint32_t> minCount{0};      // samples per pixel, for the title
@@ -223,7 +231,20 @@ static void workerLoop(Shared& S) {
         // Safe to touch scene/buffers unlocked: the main thread only mutates
         // them once activeWorkers has fallen to zero, which cannot happen
         // while we are counted.
+        uint64_t limit = S.passLimit.load(std::memory_order_relaxed);
+        if (limit && S.work.load(std::memory_order_relaxed) >= limit) {
+            // Pass finished; wait for the main thread to publish and reset.
+            { std::lock_guard<std::mutex> lk(S.mtx); --S.activeWorkers; }
+            S.cv.notify_all();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            continue;
+        }
         uint64_t w = S.work.fetch_add(1, std::memory_order_relaxed);
+        if (limit && w >= limit) {
+            { std::lock_guard<std::mutex> lk(S.mtx); --S.activeWorkers; }
+            S.cv.notify_all();
+            continue;
+        }
         int      tile = S.tileOrder[size_t(w % uint64_t(S.numTiles))];
         uint64_t samp = w / uint64_t(S.numTiles);
         // Claim the tile.  If another worker is a full pass behind and still
@@ -484,7 +505,7 @@ int main(int argc, char** argv) {
     SDL_Window* win = SDL_CreateWindow("kerrview",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, winW, winH,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!win || !ren) {
         std::fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError());
         SDL_Quit();
@@ -504,6 +525,7 @@ int main(int argc, char** argv) {
     S.rt.winW = winW; S.rt.winH = winH; S.rt.scale = 8;
     S.cam.aspect = Real(winW) / winH;
     S.display.assign(size_t(winW) * winH * 3, 0u);
+    S.present = S.display;
     resetAccumulation(S);
 
     std::printf("kerrview -- %d x %d, %d worker threads\n", winW, winH, nThreads);
@@ -537,6 +559,8 @@ int main(int argc, char** argv) {
     S.exposure.store(std::exp(logExposure) * userExposure, std::memory_order_relaxed);
     double fps = 0.0;
     auto  lastFrame = Clock::now();
+    auto  lastTick  = Clock::now();   // animation clock, independent of the frame timer
+    auto  lastPresent = Clock::now() - std::chrono::seconds(1);
     bool  running = true;
     int   snapshotIndex = 0;
 
@@ -547,6 +571,9 @@ int main(int argc, char** argv) {
         // is exactly how the exposure used to end up meaningless while moving.
         logExposure = updateExposure(S, key, userExposure, logExposure);
 
+        // Regime for this frame, decided before events so the snapshot paths
+        // below can tell which buffer is on screen.
+        bool moving = since(lastInput) < 0.25 || playing;
         bool camChanged = false;
 
         // Advancing the disk invalidates the accumulated image exactly as a
@@ -554,10 +581,20 @@ int main(int argc, char** argv) {
         // means an animating disk never settles -- which is not a limitation
         // but arithmetic: a changing scene has nothing to accumulate.  Pause
         // with space to let it converge.
-        if (playing) {
-            double dtWall = std::min(0.1, since(lastFrame));   // clamp a hitch
-            tWanted += dtWall * timeScale;
-            camChanged = true;
+        // The animation clock needs its own timestamp, sampled at the same
+        // point every frame.  Reading `since(lastFrame)` here measured the
+        // interval from the *end* of the previous frame to the top of this
+        // one -- the loop tail, a few hundred microseconds -- rather than a
+        // whole frame, which ran the disk about a hundred times too slowly.
+        // It is advanced even while paused so resuming does not jump.
+        {
+            auto now = Clock::now();
+            double dtWall = std::min(0.1, std::chrono::duration<double>(now - lastTick).count());
+            lastTick = now;
+            if (playing) {
+                tWanted += dtWall * timeScale;
+                camChanged = true;
+            }
         }
 
         // Scripted motion, so the interactive path can be exercised headlessly.
@@ -567,7 +604,7 @@ int main(int argc, char** argv) {
         }
         if (autoQuit > 0 && since(startTime) > autoQuit) {
             std::vector<uint8_t> copy;
-            reconfigure(S, [&] { copy = S.display; });
+            reconfigure(S, [&] { copy = moving ? S.present : S.display; });
             img::writePng("kerrview-auto.png", winW, winH, copy);
             std::printf("  autoquit: wrote kerrview-auto.png at %u spp, scale 1/%d, %.2f Mrays/s\n",
                         S.minCount.load(), S.rt.scale, raysPerSec / 1e6);
@@ -589,6 +626,8 @@ int main(int argc, char** argv) {
                         S.rt.winW = winW; S.rt.winH = winH;
                         S.cam.aspect = Real(winW) / std::max(1, winH);
                         S.display.assign(size_t(winW) * winH * 3, 0u);
+                        S.present = S.display;
+                        camWanted.aspect = S.cam.aspect;
                         resetAccumulation(S);
                     });
                     lastInput = Clock::now();
@@ -699,7 +738,7 @@ int main(int argc, char** argv) {
                     char name[128];
                     std::snprintf(name, sizeof name, "kerrview-%03d.png", snapshotIndex++);
                     std::vector<uint8_t> copy;
-                    reconfigure(S, [&] { copy = S.display; });
+                    reconfigure(S, [&] { copy = moving ? S.present : S.display; });
                     if (img::writePng(name, winW, winH, copy))
                         std::printf("  wrote %s  (%u spp)\n", name, S.minCount.load());
                     else
@@ -715,7 +754,7 @@ int main(int argc, char** argv) {
         if (camChanged) lastInput = Clock::now();
 
         // --- choose the regime -------------------------------------------
-        bool moving = since(lastInput) < 0.25 || playing;
+        moving = since(lastInput) < 0.25 || playing;
         int desiredScale;
         if (moving) {
             // Pick the coarsest-to-finest scale that still fits one sample per
@@ -741,14 +780,34 @@ int main(int argc, char** argv) {
         bool passComplete = S.work.load(std::memory_order_relaxed) >= uint64_t(S.numTiles);
         if (camChanged) sceneDirty = true;
 
-        if ((sceneDirty && passComplete) || desiredScale != S.rt.scale) {
+        if ((passComplete && (sceneDirty || moving)) || desiredScale != S.rt.scale) {
             reconfigure(S, [&] {
-                S.rt.scale = desiredScale;
-                S.cam  = camWanted;       // published with every worker parked
-                S.tObs = tWanted;
-                resetAccumulation(S);
+                // Publish the finished pass.  While moving, the texture is
+                // uploaded from this copy rather than from the live buffer, so
+                // every frame shown has exactly one sample per pixel at one
+                // instant.  Reading the live buffer instead shows a mix of two
+                // passes, which appears as rectangular tile patches of
+                // differing noise and differing epoch.
+                S.present = S.display;
+                if (sceneDirty) {
+                    S.rt.scale = desiredScale;
+                    S.cam  = camWanted;   // published with every worker parked
+                    S.tObs = tWanted;
+                    resetAccumulation(S);
+                }
+                // Exactly one sample per tile while moving; unlimited once
+                // settled, so the image goes on converging.
+                S.passLimit.store(moving ? uint64_t(S.numTiles) : 0,
+                                  std::memory_order_relaxed);
             });
             sceneDirty = false;
+        }
+        if (desiredScale != S.rt.scale) {
+            reconfigure(S, [&] {
+                S.rt.scale = desiredScale;
+                resetAccumulation(S);
+                S.passLimit.store(moving ? uint64_t(S.numTiles) : 0, std::memory_order_relaxed);
+            });
         }
 
         // --- throughput and exposure --------------------------------------
@@ -767,13 +826,30 @@ int main(int argc, char** argv) {
         }
 
         // --- present -------------------------------------------------------
-        SDL_UpdateTexture(tex, nullptr, S.display.data(), winW * 3);
-        SDL_RenderCopy(ren, tex, nullptr, nullptr);
-        SDL_RenderPresent(ren);
+        //
+        // The loop deliberately does not block on vsync.  A capped pass can
+        // finish part way through a display interval, and if publication waits
+        // for the next vsync every worker sits idle until then -- measured at a
+        // third of total throughput, which the adaptive scale then pays for in
+        // resolution.  Polling fast and presenting on a timer instead keeps
+        // both: the pass is published as soon as it completes, while the screen
+        // still updates at 60 Hz.
+        if (since(lastPresent) >= 1.0 / 60.0) {
+            // While moving, show the last complete pass; while settled, show
+            // the live buffer so refinement is visible as it happens.
+            SDL_UpdateTexture(tex, nullptr,
+                              moving ? S.present.data() : S.display.data(), winW * 3);
+            SDL_RenderCopy(ren, tex, nullptr, nullptr);
+            SDL_RenderPresent(ren);
+            lastPresent = Clock::now();
 
-        double dtFrame = since(lastFrame);
-        lastFrame = Clock::now();
-        if (dtFrame > 0) fps += (1.0 / dtFrame - fps) * 0.1;
+            double dtFrame = since(lastFrame);
+            lastFrame = Clock::now();
+            if (dtFrame > 0) fps += (1.0 / dtFrame - fps) * 0.1;
+        } else {
+            // Nothing to draw yet; yield rather than spin a core on it.
+            std::this_thread::sleep_for(std::chrono::microseconds(300));
+        }
 
         if (autoQuit > 0 && since(lastStatus) > 0.5) {
             double passSamples = double(S.rt.rw) * S.rt.rh;
@@ -782,8 +858,8 @@ int main(int argc, char** argv) {
                         "first-pass %.1f Hz  %.2f Mrays/s\n",
                         since(startTime), moving ? "moving" : "settled", S.rt.scale,
                         S.rt.rw, S.rt.rh, S.minCount.load(), fps, passHz, raysPerSec / 1e6);
-            std::printf("           metering: covered %5.1f%%  anchor %.4g  target %.4g  live %.4g\n",
-                        100.0 * S.meterCovered, S.meterAnchor, S.meterTarget, S.exposure.load());
+            std::printf("           t = %7.2f M   exposure %.4g   metered from %.0f%% of the frame\n",
+                        double(S.tObs), S.exposure.load(), 100.0 * S.meterCovered);
             std::fflush(stdout);
             lastStatus = Clock::now();
         }
