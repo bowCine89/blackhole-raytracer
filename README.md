@@ -48,11 +48,16 @@ Everything above is physical except two clearly-marked knobs: `--turbulence`
 ## Build and run
 
 ```powershell
-.\build.ps1              # portable Zig toolchain in .toolchain, no install needed
+.\build.ps1              # fetches Zig + SDL2 into .toolchain on first run
 .\kerr.exe --check       # validate the geodesic engine against closed-form Kerr
 .\kerr.exe --preview     # 480x270, a couple of seconds
 .\kerr.exe               # 1280x720, 128 spp
+.\kerrview.exe           # interactive viewer
 ```
+
+`build.ps1 cli` or `build.ps1 viewer` builds just one target. Both front ends
+share one tracer: `src/render.hpp` holds the physics, and `main.cpp` and
+`viewer.cpp` only decide which rays to ask for.
 
 Any recent Clang or GCC works instead:
 
@@ -69,6 +74,94 @@ Smart App Control is in enforcement mode and is refusing to run a freshly
 written unsigned binary. `build.ps1` works around it by linking to a scratch
 name and copying into place; if you compile by hand and hit it, copy the output
 to a new filename and run that.
+
+---
+
+## The interactive viewer
+
+`kerrview.exe` drives the same path tracer in real time. Orbit with the left
+mouse button, pan with the right, dolly with the wheel, and the image keeps
+refining for as long as you leave it alone.
+
+```
+left drag     orbit (inclination and azimuth)      [ / ]   spin a/M
+right drag    pan the aim point                    , / .   disk outer radius
+wheel         dolly in/out                         - / =   exposure
+ctrl+wheel    field of view                        b       scattering bounces
+r             reset camera                         s       save a PNG
+                                                   esc/q   quit
+```
+
+### Why it has two regimes
+
+One number forces the whole design. At ~2.9 Mrays/s a 33 ms frame buys about
+**96k samples**, while a 1280×720 window has **921k pixels**. Full resolution
+cannot deliver even a *tenth* of a sample per pixel inside an interactive frame,
+so the viewer switches between:
+
+| | resolution | samples | what you see |
+|---|---|---|---|
+| **moving** | reduced, chosen from measured throughput | 1 spp, no accumulation | coarse but complete, every frame |
+| **settled** | full | accumulating forever | converges while you watch |
+
+The render scale is not a guess. It is the smallest $s$ for which one sample per
+pixel still fits the frame budget:
+
+$$
+s = \left\lceil \sqrt{\frac{W H \mkern3mu f_{\rm target}}{R}} \right\rceil,
+\qquad R = \text{measured samples per second}
+$$
+
+with $R$ tracked as a moving average, so the viewer adapts to spin, disk size and
+bounce count rather than assuming a fixed cost. Measured on the 16-core machine
+at 1280×720, target 30 fps:
+
+```
+  moving    scale 1/4   render 320x180    ui 60 fps   first-pass 44 Hz
+  settled   scale 1/1   render 1280x720   ui 60 fps   1 -> 10 spp in 4 s
+```
+
+The first-pass rate lands above the 30 Hz target because $s$ is a ceiling: $s=3$
+would have given 27 Hz, just under. The ceiling guarantees the target rather
+than averaging it.
+
+### Concurrency
+
+Workers never stop. They take items from one monotonic counter, `tile = w mod N`
+and `sample = w / N`, and cycle through tiles indefinitely — so "one more pass"
+needs no coordination.
+
+Two things make that safe:
+
+- **A pause barrier.** To change camera or resolution the main thread sets
+  `paused`, waits for the active-worker count to reach zero, mutates, then
+  releases. Because no worker can be mid-tile at that moment, a stale sample can
+  never land in a fresh buffer, and no per-tile generation tracking is needed.
+- **A per-tile claim.** Items $w$ and $w+N$ name the *same tile*, so a worker
+  that falls a full pass behind could otherwise race another on the same pixels.
+  Claiming the tile makes that impossible; a worker finding one taken simply
+  drops the item, which costs that tile one sample index.
+
+Two smaller decisions that mattered more than expected:
+
+- The display buffer is **never cleared** on a camera change — only the
+  accumulator is. New tiles overwrite the old image in place, so a move reads as
+  a refinement rather than a flash of black.
+- Workers are spawned on `hardware_concurrency() - 1` threads. Saturating every
+  core starved the event loop and held the UI at **24 fps**; giving one logical
+  core back put it at a steady **60 fps** for about 8% of sample rate.
+
+Tile size is also chosen per resolution rather than fixed: at 1/8 scale a fixed
+64-pixel tile would produce fewer tiles than threads and leave most of the
+machine idle.
+
+### Differences from the batch renderer
+
+The physics is identical — the same `tracePath`, the same validated integrator.
+The viewer omits bloom (a whole-image post pass, not tile-local) and tone maps
+each pixel as its tile is traced, using an exposure that is sampled sparsely and
+smoothed over time so the picture does not pulse as samples arrive. For a final
+image, use `kerr.exe`.
 
 ---
 
@@ -563,7 +656,9 @@ src/kerr.hpp      Kerr metric, geodesic RHS, Dormand-Prince, tetrads
 src/scene.hpp     Novikov-Thorne disk, optical-depth edge, star field
 src/spectrum.hpp  Planck, CIE 1931, sRGB, ACES
 src/image.hpp     PNG / PPM / PFM writers (no libraries)
-src/main.cpp      propagation, path tracing, camera, threading, CLI, self-test
+src/render.hpp    propagation, path tracing, camera -- shared by both front ends
+src/main.cpp      batch renderer: threading, tone mapping, CLI, self-test
+src/viewer.cpp    SDL2 viewer: progressive pipeline, camera controls
 ```
 
 ## References

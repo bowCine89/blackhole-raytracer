@@ -2,5 +2,7 @@
 .zig-cache/
 *.exe
 *.pdb
+*.dll
 *.pfm
 *.obj
+kerrview-*.png
