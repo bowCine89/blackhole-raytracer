@@ -84,22 +84,66 @@ mouse button, pan with the right, dolly with the wheel, and the image keeps
 refining for as long as you leave it alone.
 
 ```
-left drag     orbit (inclination and azimuth)      [ / ]   spin a/M
-right drag    pan the aim point                    , / .   disk outer radius
-wheel         dolly in/out                         - / =   exposure
-ctrl+wheel    field of view                        b       scattering bounces
-r             reset camera                         s       save a PNG
-                                                   esc/q   quit
+SPACE         bake an animation -> play it -> live   ESC     back out
+left drag     orbit (inclination and azimuth)        [ / ]   spin a/M
+right drag    pan the aim point                      , / .   disk radius (speed)
+wheel         dolly in/out                           - / =   exposure
+ctrl+wheel    field of view                          b       scattering bounces
+r             reset camera                           s       save PNG(s)
+                                                     q       quit
 ```
 
-The viewer shows a **single instant**; the disk does not turn here. That is
-deliberate, and the reason is arithmetic rather than effort: a rotating disk
-changes faster than the tracer converges, so an animating viewer is pinned at
-one sample per pixel forever and can never settle. Progressive refinement and
-animation are directly at odds. Rotation therefore lives in the batch renderer,
-where each frame is taken to full convergence before time advances — see
-[Offline animation](#offline-animation). `--time T` selects which instant the
-viewer shows.
+The disk does not turn *live*, and cannot: a rotating disk changes faster than
+the tracer converges, so an animating viewer would be pinned at one sample per
+pixel forever and never settle. Progressive refinement and animation are
+directly at odds.
+
+### Bake and loop
+
+What the viewer does instead is **bake**: hold the camera still, converge one
+frame, advance the clock, repeat — then loop what it captured. The whole
+workflow is one key.
+
+| state | SPACE does | what you see |
+|---|---|---|
+| **live** | start baking | the interactive image, converging when you stop moving |
+| **BAKING** | stop and play | each frame converging to `--bake-spp`, then the clock steps on |
+| **PLAYING** | back to live | the captured frames looping |
+
+`ESC` backs out of baking or playback without quitting. The bake runs until you
+stop it, so its length is simply how long you leave it — and because there is
+nowhere to draw text in the window, **the title bar is the interface**: it
+always ends with what SPACE will do next.
+
+```
+BAKING  |  frame 7/180  |  48/64 spp  |  0.31 ISCO orbits captured  |  18 MB  |  SPACE: stop and play
+PLAYING |  frame 5/24   |  24 fps     |  1.00 ISCO orbits           |  , / . speed  |  SPACE: back to live
+```
+
+Three details that matter more than they look:
+
+- **The exposure is frozen for the whole bake.** Re-metering per frame would let
+  the level drift between them, which reads as flicker on playback.
+- **Camera and scene keys are ignored while baking**, because the sequence
+  assumes a fixed camera; `,` and `.` change playback speed while playing, where
+  disk radius would mean nothing.
+- **Playback parks the workers.** There are no rays to trace, so the 31 threads
+  stop rather than burning cores on a finished image.
+
+The console reports each captured frame with the fraction of an ISCO orbit
+accumulated so far, and flags whole-orbit marks as good places to stop — the
+inner ring is then back where it began. `s` during playback writes the whole
+sequence as `kerrbake-0000.png …`.
+
+Note that a loop is never perfectly seamless, for the reason given under
+[Offline animation](#offline-animation): differential rotation gives every
+radius its own period, so no single duration returns the whole disk to its
+starting state. Stopping on a whole ISCO orbit makes the bright inner region
+loop cleanly, and the slow outer disk shifts only a few percent.
+
+`--bake-spp`, `--bake-step` and `--bake-max` set convergence per frame,
+coordinate time between frames, and the frame cap (180 frames is about 500 MB at
+720p). `--time T` selects which instant live mode shows.
 
 ### Why it has two regimes
 

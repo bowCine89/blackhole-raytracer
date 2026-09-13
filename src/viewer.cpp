@@ -79,6 +79,9 @@ struct Shared {
     std::mutex mtx;
     std::condition_variable cv;
     bool paused = false;
+    // Set while the animation is playing back: there is nothing to trace, so the
+    // workers park rather than burn every core on a finished image.
+    bool idle   = false;
     bool quit   = false;
     int  activeWorkers = 0;
 
@@ -224,7 +227,7 @@ static void workerLoop(Shared& S) {
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(S.mtx);
-            S.cv.wait(lk, [&] { return !S.paused || S.quit; });
+            S.cv.wait(lk, [&] { return (!S.paused && !S.idle) || S.quit; });
             if (S.quit) return;
             ++S.activeWorkers;
         }
@@ -411,20 +414,70 @@ static double meterInitial(const Scene& sc, const CameraParams& cam, double key)
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Bake-and-loop
+// ---------------------------------------------------------------------------
+//
+// The viewer cannot animate live -- a turning disk changes faster than the
+// tracer converges -- but it can *bake*: hold the camera still, converge one
+// frame, advance the clock, repeat, then loop what it captured.
+//
+// The interface is one context-sensitive key.  Space always does the obvious
+// next thing, and the window title always says what that is:
+//
+//     LIVE     -> space starts baking
+//     BAKING   -> space stops and plays what has been captured
+//     PLAYING  -> space returns to live
+//
+// Escape backs out of whatever is happening without quitting.
+enum class Mode { Live, Baking, Playing };
+
+static const char* modeName(Mode m) {
+    switch (m) {
+        case Mode::Baking:  return "BAKING";
+        case Mode::Playing: return "PLAYING";
+        default:            return "live";
+    }
+}
+
+struct Bake {
+    std::vector<std::vector<uint8_t>> frames;   // tone-mapped, window-sized
+    int    targetSpp = 64;       // convergence before the clock advances
+    Real   step      = -1;       // M between frames; <0 = one ISCO orbit / 96
+    int    maxFrames = 180;      // ~500 MB at 720p
+    Real   t0        = 0;        // clock at the first frame
+
+    double fps       = 24.0;     // playback rate
+    double playHead  = 0;        // fractional frame index
+    double lockedExposure = 0;   // frozen during a bake, so playback cannot flicker
+
+    size_t bytes() const { return frames.empty() ? 0 : frames.size() * frames[0].size(); }
+    Real   span()  const { return frames.empty() ? 0 : Real(frames.size()) * step; }
+};
+
 static void printControls() {
     std::printf(
 "\nControls\n"
+"  SPACE                bake an animation -> play it -> back to live\n"
+"  ESC                  back out of baking or playback\n"
+"\n"
 "  left drag            orbit (inclination and azimuth)\n"
 "  right drag           pan the aim point\n"
 "  wheel                dolly in/out\n"
 "  ctrl + wheel         field of view\n"
 "  [ / ]                spin a/M down / up\n"
-"  , / .                disk outer radius\n"
+"  , / .                disk outer radius   (playback speed while playing)\n"
 "  - / =                exposure\n"
 "  b                    cycle scattering bounces (0-4)\n"
 "  r                    reset the camera\n"
 "  s                    save a PNG snapshot\n"
-"  esc or q             quit\n\n");
+"  q                    quit\n"
+"\n"
+"The disk does not turn in live mode: it changes faster than the tracer can\n"
+"converge.  SPACE bakes a sequence instead -- the camera holds still, each\n"
+"frame is taken to --bake-spp samples before the clock advances -- and loops\n"
+"it back when you press SPACE again.  The window title always says what SPACE\n"
+"will do next.\n\n");
 }
 
 int main(int argc, char** argv) {
@@ -434,8 +487,12 @@ int main(int argc, char** argv) {
     int  winW = 1280, winH = 720;
     Real diskIn = -1, diskOut = 18.0;
     Real targetFps = 30.0;
+    int   bakeSpp = 64;      // samples per pixel before a baked frame is kept
+    int   bakeMax = 180;     // frame cap; about 500 MB at 720p
+    Real  bakeStep = -1;     // M between frames; <0 = one ISCO orbit / 96
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
+    int    autoBake = 0;        // scripted: bake N frames, play, then quit
     double userExposure = 1.0, key = 1.3;
     int threads = 0;
 
@@ -461,6 +518,10 @@ int main(int argc, char** argv) {
         else if (a == "--exposure")   userExposure = nextF();
         else if (a == "--fps")        targetFps = nextF();
         else if (a == "--time")       S.tObs = nextF();
+        else if (a == "--bake-spp")   bakeSpp = nextI();
+        else if (a == "--bake-step")  bakeStep = nextF();
+        else if (a == "--bake-max")   bakeMax = nextI();
+        else if (a == "--autobake")   autoBake = nextI();
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
         else if (a == "--autoorbit")  autoOrbit = true;
@@ -539,6 +600,13 @@ int main(int argc, char** argv) {
     CameraParams camWanted = S.cam;
     Real         tWanted   = S.tObs;
     bool         sceneDirty = false;   // a change is pending publication
+
+    Mode mode = Mode::Live;
+    Bake bake;
+    bake.targetSpp = bakeSpp;
+    bake.maxFrames = bakeMax;
+    bake.step = (bakeStep > 0) ? bakeStep
+                              : (TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true))) / 96.0;
     const CameraParams home = camWanted;
 
     bool  dragOrbit = false, dragPan = false;
@@ -554,6 +622,7 @@ int main(int argc, char** argv) {
     double fps = 0.0;
     auto  lastFrame = Clock::now();
     auto  lastPresent = Clock::now() - std::chrono::seconds(1);
+    auto  lastPlayTick = Clock::now();
     bool  running = true;
     int   snapshotIndex = 0;
 
@@ -566,7 +635,7 @@ int main(int argc, char** argv) {
 
         // Regime for this frame, decided before events so the snapshot paths
         // below can tell which buffer is on screen.
-        bool moving = since(lastInput) < 0.25;
+        bool moving = (mode == Mode::Live) && since(lastInput) < 0.25;
         bool camChanged = false;
 
         // Advancing the disk invalidates the accumulated image exactly as a
@@ -585,6 +654,30 @@ int main(int argc, char** argv) {
         // frame of a sequence can be taken to full convergence: see
         // `kerr.exe --frames`.
 
+        // Scripted bake, so the workflow can be exercised headlessly.
+        if (autoBake > 0) {
+            if (mode == Mode::Live && since(startTime) > 0.4) {
+                bake.frames.clear();
+                bake.t0 = tWanted;
+                bake.lockedExposure = S.exposure.load();
+                mode = Mode::Baking;
+                sceneDirty = true;
+                std::printf("  [auto] baking %d frames\n", autoBake);
+                std::fflush(stdout);
+            } else if (mode == Mode::Baking && int(bake.frames.size()) >= autoBake) {
+                mode = Mode::Playing;
+                bake.playHead = 0;
+                for (size_t i = 0; i < bake.frames.size(); ++i) {
+                    char nm[128];
+                    std::snprintf(nm, sizeof nm, "kerrbake-%04zu.png", i);
+                    img::writePng(nm, winW, winH, bake.frames[i]);
+                }
+                std::printf("  [auto] playing %zu frames (exported for inspection)\n",
+                            bake.frames.size());
+                std::fflush(stdout);
+            }
+        }
+
         // Scripted motion, so the interactive path can be exercised headlessly.
         if (autoOrbit && since(startTime) < autoQuit * 0.6) {
             camWanted.phiDeg += 1.5;
@@ -592,7 +685,10 @@ int main(int argc, char** argv) {
         }
         if (autoQuit > 0 && since(startTime) > autoQuit) {
             std::vector<uint8_t> copy;
-            reconfigure(S, [&] { copy = moving ? S.present : S.display; });
+            if (mode == Mode::Playing && !bake.frames.empty())
+                copy = bake.frames[std::min(bake.frames.size() - 1, size_t(bake.playHead))];
+            else
+                reconfigure(S, [&] { copy = moving ? S.present : S.display; });
             img::writePng("kerrview-auto.png", winW, winH, copy);
             std::printf("  autoquit: wrote kerrview-auto.png at %u spp, scale 1/%d, %.2f Mrays/s\n",
                         S.minCount.load(), S.rt.scale, raysPerSec / 1e6);
@@ -632,6 +728,7 @@ int main(int argc, char** argv) {
                 break;
 
             case SDL_MOUSEMOTION:
+                if (mode != Mode::Live) break;   // the sequence assumes a fixed camera
                 if (dragOrbit && (e.motion.xrel || e.motion.yrel)) {
                     camWanted.phiDeg += e.motion.xrel * 0.25;
                     camWanted.incDeg = clampf(camWanted.incDeg - e.motion.yrel * 0.25, 1.0, 179.0);
@@ -644,6 +741,7 @@ int main(int argc, char** argv) {
                 break;
 
             case SDL_MOUSEWHEEL: {
+                if (mode != Mode::Live) break;
                 bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
                 if (ctrl) {
                     camWanted.fovDeg = clampf(camWanted.fovDeg * std::exp(-e.wheel.y * 0.08), 2.0, 120.0);
@@ -658,10 +756,56 @@ int main(int argc, char** argv) {
 
             case SDL_KEYDOWN:
                 switch (e.key.keysym.sym) {
-                case SDLK_ESCAPE: case SDLK_q: running = false; break;
+                case SDLK_q: running = false; break;
+
+                // One key for the whole workflow.  Whatever is on screen, space
+                // does the next sensible thing, and the title says what that is.
+                case SDLK_SPACE:
+                    if (mode == Mode::Live) {
+                        bake.frames.clear();
+                        bake.t0 = tWanted;
+                        bake.lockedExposure = S.exposure.load();
+                        mode = Mode::Baking;
+                        sceneDirty = true;
+                        std::printf("  BAKING: %d spp per frame, %.2f M apart, up to %d frames."
+                                    "  SPACE to stop and play.\n",
+                                    bake.targetSpp, double(bake.step), bake.maxFrames);
+                    } else if (mode == Mode::Baking) {
+                        if (bake.frames.size() >= 2) {
+                            mode = Mode::Playing;
+                            bake.playHead = 0;
+                            std::printf("  PLAYING %zu frames at %.0f fps (%.1f M, %.2f ISCO orbits)."
+                                        "  SPACE for live.\n",
+                                        bake.frames.size(), bake.fps, double(bake.span()),
+                                        double(bake.span() / (TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true)))));
+                        } else {
+                            std::printf("  need at least 2 frames to play; still baking\n");
+                        }
+                    } else {
+                        mode = Mode::Live;
+                        tWanted = bake.t0;
+                        sceneDirty = true;
+                        std::printf("  live\n");
+                    }
+                    std::fflush(stdout);
+                    lastInput = Clock::now();
+                    break;
+
+                // Escape backs out of whatever is happening, without quitting.
+                case SDLK_ESCAPE:
+                    if (mode != Mode::Live) {
+                        mode = Mode::Live;
+                        tWanted = bake.t0;
+                        sceneDirty = true;
+                        std::printf("  cancelled, back to live\n");
+                        std::fflush(stdout);
+                        lastInput = Clock::now();
+                    }
+                    break;
                 case SDLK_r: camWanted = home; camChanged = true; break;
                 case SDLK_LEFTBRACKET:
                 case SDLK_RIGHTBRACKET: {
+                    if (mode != Mode::Live) break;
                     Real d = (e.key.keysym.sym == SDLK_RIGHTBRACKET) ? 0.02 : -0.02;
                     reconfigure(S, [&] {
                         sc.kerr = Kerr(clampf(sc.kerr.a + d, -0.999, 0.999));
@@ -678,6 +822,13 @@ int main(int argc, char** argv) {
                 case SDLK_COMMA:
                 case SDLK_PERIOD: {
                     Real f = (e.key.keysym.sym == SDLK_PERIOD) ? 1.1 : 1.0 / 1.1;
+                    if (mode == Mode::Playing) {   // same keys, obvious meaning
+                        bake.fps = clampf(bake.fps * f, 1.0, 120.0);
+                        std::printf("  playback %.0f fps\n", bake.fps);
+                        std::fflush(stdout);
+                        break;
+                    }
+                    if (mode != Mode::Live) break;
                     diskOut = clampf(diskOut * f, sc.disk.rIn * 1.2, 400.0);
                     reconfigure(S, [&] {
                         sc.disk.init(sc.kerr, diskIn, diskOut);
@@ -691,6 +842,7 @@ int main(int argc, char** argv) {
                 case SDLK_MINUS:  userExposure *= 1.0 / 1.25; break;
                 case SDLK_EQUALS: userExposure *= 1.25;       break;
                 case SDLK_b: {
+                    if (mode != Mode::Live) break;
                     reconfigure(S, [&] {
                         sc.maxBounces = (sc.maxBounces + 1) % 5;
                         resetAccumulation(S);
@@ -701,6 +853,19 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case SDLK_s: {
+                    // During playback, save the whole baked sequence -- having
+                    // just watched it, that is obviously what "save" means.
+                    if (mode == Mode::Playing && !bake.frames.empty()) {
+                        int written = 0;
+                        for (size_t i = 0; i < bake.frames.size(); ++i) {
+                            char name[128];
+                            std::snprintf(name, sizeof name, "kerrbake-%04zu.png", i);
+                            if (img::writePng(name, winW, winH, bake.frames[i])) ++written;
+                        }
+                        std::printf("  wrote %d frames as kerrbake-0000.png ...\n", written);
+                        std::fflush(stdout);
+                        break;
+                    }
                     char name[128];
                     std::snprintf(name, sizeof name, "kerrview-%03d.png", snapshotIndex++);
                     std::vector<uint8_t> copy;
@@ -719,8 +884,58 @@ int main(int argc, char** argv) {
         }
         if (camChanged) lastInput = Clock::now();
 
+        // --- bake and playback ---------------------------------------------
+        //
+        // Baking forces the settled regime: full resolution, unlimited
+        // accumulation, camera held still.  When the frame reaches its sample
+        // target it is captured and the clock steps on.
+        if (mode == Mode::Baking) {
+            // Freeze the exposure for the whole sequence.  Re-metering per
+            // frame would let the level drift between them, which reads as
+            // flicker during playback.
+            S.exposure.store(bake.lockedExposure, std::memory_order_relaxed);
+
+            if (S.minCount.load() >= uint32_t(bake.targetSpp)) {
+                bake.frames.push_back(S.display);
+                tWanted += bake.step;
+                sceneDirty = true;
+
+                Real period = TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true));
+                Real orbits = bake.span() / period;
+                std::printf("  frame %3zu   t = %7.2f M   %.3f ISCO orbits   %.0f MB%s\n",
+                            bake.frames.size(), double(tWanted - bake.t0), double(orbits),
+                            bake.bytes() / 1.0e6,
+                            (std::fabs(orbits - std::round(orbits)) < 0.5 * double(bake.step) / double(period)
+                             && orbits >= 0.9) ? "   <- whole orbit, good loop point" : "");
+                std::fflush(stdout);
+
+                if (int(bake.frames.size()) >= bake.maxFrames) {
+                    mode = Mode::Playing;
+                    bake.playHead = 0;
+                    std::printf("  frame limit reached; PLAYING %zu frames\n", bake.frames.size());
+                    std::fflush(stdout);
+                }
+            }
+        }
+
+        // Playback needs no rays at all, so park the workers rather than leave
+        // 31 threads spinning on an image nobody is looking at.
+        {
+            bool wantIdle = (mode == Mode::Playing);
+            std::unique_lock<std::mutex> lk(S.mtx);
+            if (S.idle != wantIdle) { S.idle = wantIdle; lk.unlock(); S.cv.notify_all(); }
+        }
+
+        if (mode == Mode::Playing && !bake.frames.empty()) {
+            bake.playHead += bake.fps * std::min(0.25, since(lastPlayTick));
+            lastPlayTick = Clock::now();
+            if (bake.playHead >= double(bake.frames.size())) bake.playHead = 0;
+        } else {
+            lastPlayTick = Clock::now();
+        }
+
         // --- choose the regime -------------------------------------------
-        moving = since(lastInput) < 0.25;
+        moving = (mode == Mode::Live) && since(lastInput) < 0.25;
         int desiredScale;
         if (moving) {
             // Pick the coarsest-to-finest scale that still fits one sample per
@@ -801,10 +1016,17 @@ int main(int argc, char** argv) {
         // both: the pass is published as soon as it completes, while the screen
         // still updates at 60 Hz.
         if (since(lastPresent) >= 1.0 / 60.0) {
-            // While moving, show the last complete pass; while settled, show
-            // the live buffer so refinement is visible as it happens.
-            SDL_UpdateTexture(tex, nullptr,
-                              moving ? S.present.data() : S.display.data(), winW * 3);
+            // Playback shows a baked frame; otherwise the last complete pass
+            // while moving, or the live buffer while settled so refinement is
+            // visible as it happens.
+            const uint8_t* src;
+            if (mode == Mode::Playing && !bake.frames.empty()) {
+                size_t i = std::min(bake.frames.size() - 1, size_t(bake.playHead));
+                src = bake.frames[i].data();
+            } else {
+                src = moving ? S.present.data() : S.display.data();
+            }
+            SDL_UpdateTexture(tex, nullptr, src, winW * 3);
             SDL_RenderCopy(ren, tex, nullptr, nullptr);
             SDL_RenderPresent(ren);
             lastPresent = Clock::now();
@@ -830,13 +1052,36 @@ int main(int argc, char** argv) {
             lastStatus = Clock::now();
         }
         if (since(lastTitle) > 0.2) {
-            char title[256];
-            std::snprintf(title, sizeof title,
-                "kerrview  |  %s  1/%d res  |  %u spp  |  %.0f fps  |  %.2f Mrays/s  |  "
-                "a=%.2f  r=%.0fM  inc=%.0f  fov=%.0f",
-                moving ? "moving" : "settling", S.rt.scale, S.minCount.load(),
-                fps, raysPerSec / 1e6,
-                sc.kerr.a, double(camWanted.camR), double(camWanted.incDeg), double(camWanted.fovDeg));
+            // The title is the only text surface available, so it carries the
+            // whole interface: what state we are in, how it is progressing, and
+            // -- last, always -- what SPACE will do next.
+            char title[320];
+            Real period = TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true));
+            switch (mode) {
+            case Mode::Baking:
+                std::snprintf(title, sizeof title,
+                    "BAKING  |  frame %zu/%d  |  %u/%d spp  |  %.2f ISCO orbits captured  |  "
+                    "%.0f MB  |  SPACE: stop and play    ESC: cancel",
+                    bake.frames.size() + 1, bake.maxFrames,
+                    S.minCount.load(), bake.targetSpp,
+                    double(bake.span() / period), bake.bytes() / 1.0e6);
+                break;
+            case Mode::Playing:
+                std::snprintf(title, sizeof title,
+                    "PLAYING  |  frame %zu/%zu  |  %.0f fps  |  %.2f ISCO orbits  |  "
+                    ", / . speed  |  SPACE: back to live",
+                    size_t(bake.playHead) + 1, bake.frames.size(), bake.fps,
+                    double(bake.span() / period));
+                break;
+            default:
+                std::snprintf(title, sizeof title,
+                    "kerrview  |  %s 1/%d res  |  %u spp  |  %.1f Mrays/s  |  "
+                    "a=%.2f r=%.0fM inc=%.0f  |  SPACE: bake an animation",
+                    moving ? "moving" : "settled", S.rt.scale, S.minCount.load(),
+                    raysPerSec / 1e6,
+                    sc.kerr.a, double(camWanted.camR), double(camWanted.incDeg));
+                break;
+            }
             SDL_SetWindowTitle(win, title);
             lastTitle = Clock::now();
         }
