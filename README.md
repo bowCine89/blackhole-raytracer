@@ -132,6 +132,40 @@ scalar backend now chooses **1/2 — four times the pixels at the same frame
 rate** — while settled convergence went from 10 spp to 46 spp in three seconds.
 Nothing in the viewer was retuned for it.
 
+### Making one sample per pixel watchable
+
+Two things had to be fixed before an animating disk looked like anything.
+
+**A pass has to finish before the scene is allowed to change.** The display loop
+runs at 60 Hz while a full pass completes at about 40, so resetting the
+accumulator every frame wiped it before any pass had finished. Coverage sat
+permanently at **53%**: half the frame current, half leftovers, never resolving —
+which reads exactly as a stall. Scene changes are now *coalesced* and applied
+only once the current pass has completed, so every image shown is a complete
+render of one state, at a cost of at most one pass of input latency (~25 ms).
+Publishing the camera at that moment also closed a real data race: it used to be
+mutated in the event handler while workers were reading it.
+
+**One wavelength per pixel is not enough.** With a single wavelength per sample
+every pixel is a saturated colour, and at one sample per pixel — the regime the
+viewer lives in whenever anything moves — the image is dominated by chromatic
+speckle.
+
+The cure is unusually cheap *here*, for a reason specific to this renderer: in
+general relativity the null geodesic does not depend on wavelength at all. There
+is no dispersion, so one traced path is valid for every wavelength at once, and
+only two lines in the whole tracer actually read $\lambda$. Each path now
+carries **four** wavelengths, stratified across the band:
+
+| | chromatic noise | throughput |
+|---|--:|--:|
+| 1 wavelength per path | 0.309 | 10.8 Mrays/s |
+| 4 wavelengths per path | **0.139** | 9.35 Mrays/s |
+
+Measured as the mean chromaticity difference between two seeds at 16 spp: a
+**2.2× reduction**, against the $\sqrt{4} = 2$ the sample count alone would
+predict, for **13%** throughput. The batch renderer gets the same benefit.
+
 ### Exposure
 
 Auto-exposure in a progressive renderer is harder than in a batch one, because
@@ -438,8 +472,11 @@ just a loop:
 
 ### 5. Emission and relativistic transfer
 
-Each camera sample carries a **single wavelength** — the renderer is spectral,
-not RGB. Emission is a blackbody at the local temperature,
+The renderer is **spectral**, not RGB. Each path carries `NLAMBDA` = 4
+wavelengths stratified across the band — the geodesic does not depend on
+wavelength at all, so they ride along for the cost of a few Planck evaluations,
+which is what keeps a one-sample-per-pixel image from drowning in chromatic
+noise. Emission is a blackbody at the local temperature,
 
 $$B_\lambda(\lambda, T) = \frac{2hc^2}{\lambda^5}\mkern3mu \frac{1}{e^{hc/\lambda k_B T} - 1},$$
 
@@ -640,8 +677,12 @@ alone costs $\sim 10^{-10}$ of that per evaluation.
 
 16-core / 32-thread Zen 5 (Ryzen 9 9950X), 640×360 at 32 spp, default settings.
 
-**11.3 Mrays/s**, from 1.03 where this started. The 1920×1080 hero image at
-384 spp takes **58 s**, down from 266 s.
+**9.4 Mrays/s**, from 1.03 where this started — and each ray now carries four
+wavelengths rather than one, so the spectral sample rate is ~37 M/s. The
+1920×1080 hero image at 384 spp takes about 70 s, down from 266 s.
+
+The per-ray figures below were measured with one wavelength per path; carrying
+four costs a further 13%, bought back several times over in noise.
 
 ### Packet tracing: eight rays per lane
 

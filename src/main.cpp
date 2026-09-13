@@ -648,11 +648,18 @@ int main(int argc, char** argv) {
 
                     // The sample index fully determines the ray, so the two
                     // paths below differ only in how many are in flight at once.
-                    auto sampleOf = [&](int s, Real& lambda, Real& sx, Real& sy) {
+                    // Each path carries NLAMBDA wavelengths, stratified across
+                    // the band and rotated per sample, so one integration
+                    // yields several spectral estimates.
+                    auto sampleOf = [&](int s, Real* lam, Real& sx, Real& sy) {
                         Real u1 = rx + 0.7548776662 * (s + 1); u1 -= std::floor(u1);
                         Real u2 = ry + 0.5698402910 * (s + 1); u2 -= std::floor(u2);
                         Real ul = rl + (s + 0.5) / c.spp;      ul -= std::floor(ul);
-                        lambda = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
+                        for (int k = 0; k < spec::NLAMBDA; ++k) {
+                            Real f = ul + Real(k) / spec::NLAMBDA;
+                            f -= std::floor(f);
+                            lam[k] = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * f;
+                        }
                         sx = 2.0 * (x + u1) / W - 1.0;
                         sy = 1.0 - 2.0 * (y + u2) / H;
                     };
@@ -665,7 +672,7 @@ int main(int argc, char** argv) {
                         for (int s = 0; s < c.spp; s += LANES) {
                             int n = std::min(LANES, c.spp - s);
                             Geodesic gp[LANES];
-                            Real lam[LANES];
+                            Real lam[LANES][spec::NLAMBDA];
                             Rng  rgs[LANES];
                             for (int j = 0; j < n; ++j) {
                                 Real sx, sy;
@@ -674,25 +681,29 @@ int main(int argc, char** argv) {
                                 rgs[j] = Rng(uint64_t(y) * W + x + 1,
                                              c.seed + uint64_t(s + j) * 0x9E3779B97F4A7C15ull);
                             }
-                            Real rad[LANES];
+                            Real rad[LANES][spec::NLAMBDA];
                             tracePacket(kerr, disk, sky, prop, gp, lam, rgs,
                                         c.maxBounces, n, rad, c.tObs, &localSteps);
                             for (int j = 0; j < n; ++j)
-                                if (rad[j] > 0) xyz += spec::cieXYZ(lam[j]) * rad[j];
+                                for (int k = 0; k < spec::NLAMBDA; ++k)
+                                    if (rad[j][k] > 0) xyz += spec::cieXYZ(lam[j][k]) * rad[j][k];
                             localRays += uint64_t(n);
                         }
                     } else {
                         for (int s = 0; s < c.spp; ++s) {
-                            Real lambda, sx, sy;
-                            sampleOf(s, lambda, sx, sy);
+                            Real lam[spec::NLAMBDA], sx, sy;
+                            sampleOf(s, lam, sx, sy);
                             Geodesic g = cam.ray(sx, sy);
-                            Real L = tracePath(kerr, disk, sky, prop, g, lambda, rng, c.maxBounces, c.tObs, &localSteps);
-                            if (L > 0) xyz += spec::cieXYZ(lambda) * L;
+                            Real rad[spec::NLAMBDA];
+                            tracePath(kerr, disk, sky, prop, g, lam, rad, rng,
+                                      c.maxBounces, c.tObs, &localSteps);
+                            for (int k = 0; k < spec::NLAMBDA; ++k)
+                                if (rad[k] > 0) xyz += spec::cieXYZ(lam[k]) * rad[k];
                             ++localRays;
                         }
                     }
 
-                    Real inv = lamScale / c.spp;
+                    Real inv = lamScale / (Real(c.spp) * spec::NLAMBDA);
                     size_t o = (size_t(y) * W + x) * 3;
                     xyzBuf[o + 0] = xyz.x * inv;
                     xyzBuf[o + 1] = xyz.y * inv;

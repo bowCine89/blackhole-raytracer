@@ -131,12 +131,13 @@ inline Vec3 asymptoticDirection(const Kerr& k, const State& y, Real E, Real L) {
 // `shift` tracks nu_local / nu_camera along the path.  Its reciprocal is the
 // familiar g-factor, and because I_lambda * lambda^5 is invariant, a source of
 // local temperature T contributes g^5 * B_lambda(g * lambda0, T).
-inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
-                      const Propagator& prop, Geodesic g, Real lambda0,
+inline void tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
+                      const Propagator& prop, Geodesic g,
+                      const Real* lambda0, Real* radianceOut,
                       Rng& rng, int maxBounces, Real tObs = 0,
                       uint64_t* steps = nullptr)
 {
-    Real radiance = 0;
+    for (int k = 0; k < spec::NLAMBDA; ++k) radianceOut[k] = 0;
     Real shift = 1;
     // Coordinate time accumulated backwards along the path.  A photon reaching
     // the camera at tObs left the surface it last touched `travel` earlier, so
@@ -167,7 +168,8 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
             Real gs = 1 / nuRatio;
             Real gs2 = gs * gs, gs5 = gs2 * gs2 * gs;
             Vec3 dir = asymptoticDirection(kerr, yEnd, g.E, g.L);
-            radiance += throughput * gs5 * sky.radiance(dir, lambda0 * gs, bounce == 0);
+            for (int k = 0; k < spec::NLAMBDA; ++k)
+                radianceOut[k] += throughput * gs5 * sky.radiance(dir, lambda0[k] * gs, bounce == 0);
             break;
         }
 
@@ -216,7 +218,9 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
         Real gs = 1 / shift;
         Real gs2 = gs * gs, gs5 = gs2 * gs2 * gs;
         Real T = disk.temperature(r, ph, tEmit);
-        if (T > 0) radiance += throughput * gs5 * spec::planck(lambda0 * gs, T);
+        if (T > 0)
+            for (int k = 0; k < spec::NLAMBDA; ++k)
+                radianceOut[k] += throughput * gs5 * spec::planck(lambda0[k] * gs, T);
 
         if (bounce++ >= maxBounces) break;
         // Russian roulette on the grey albedo: survivors keep unit weight.
@@ -245,7 +249,6 @@ inline Real tracePath(const Kerr& kerr, const Disk& disk, const Sky& sky,
         g.L   = pl[3];
         if (!(g.E > 0)) break;
     }
-    return radiance;
 }
 
 // ---------------------------------------------------------------------------

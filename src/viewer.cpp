@@ -134,16 +134,17 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
     uint64_t traced = 0;
 
     // Deposit one finished sample and repaint the block it stands for.
-    auto shade = [&](size_t idx, int x, int y, Real lambda, Real L) {
+    auto shade = [&](size_t idx, int x, int y, const Real* lam, const Real* L) {
         double* a = &S.accum[idx * 3];
-        if (L > 0) {
-            Vec3 c = spec::cieXYZ(lambda);
-            a[0] += c.x * L; a[1] += c.y * L; a[2] += c.z * L;
+        for (int k = 0; k < spec::NLAMBDA; ++k) {
+            if (L[k] <= 0) continue;
+            Vec3 c = spec::cieXYZ(lam[k]);
+            a[0] += c.x * L[k]; a[1] += c.y * L[k]; a[2] += c.z * L[k];
         }
         uint32_t n = ++S.count[idx];
 
         // Tone map this pixel now, while its data is hot in cache.
-        Real inv = sc.lamScale / n * expScale;
+        Real inv = sc.lamScale / (Real(n) * spec::NLAMBDA) * expScale;
         Vec3 v = spec::xyzToLinearSrgb({a[0] * inv, a[1] * inv, a[2] * inv});
         v = spec::desaturateHighlights({std::max<Real>(0, v.x),
                                         std::max<Real>(0, v.y),
@@ -169,7 +170,7 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
             const int n = std::min(LANES, x1 - x);
 
             Geodesic gp[LANES];
-            Real     lam[LANES];
+            Real     lam[LANES][spec::NLAMBDA];
             Rng      rgs[LANES];
             size_t   idxs[LANES];
 
@@ -190,14 +191,17 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
                 Real ul = fract(0.6180339887 * Real(sampleIdx) + o3);
 
                 rgs[j] = Rng(idx + 1, sc.seed + sampleIdx * 0x9E3779B97F4A7C15ull);
-                lam[j] = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
+                for (int k = 0; k < spec::NLAMBDA; ++k) {
+                    Real f = ul + Real(k) / spec::NLAMBDA; f -= std::floor(f);
+                    lam[j][k] = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * f;
+                }
 
                 Real sx = 2.0 * (px + u1) / rt.rw - 1.0;
                 Real sy = 1.0 - 2.0 * (y + u2) / rt.rh;
                 gp[j] = cam.ray(sx, sy);
             }
 
-            Real rad[LANES];
+            Real rad[LANES][spec::NLAMBDA];
             tracePacket(sc.kerr, sc.disk, sc.sky, sc.prop, gp, lam, rgs,
                         sc.maxBounces, n, rad, S.tObs);
             traced += uint64_t(n);
@@ -304,7 +308,9 @@ static double meterAccumulator(Shared& S, double& coverage) {
     for (size_t i = 0; i < n; i += stride) {
         ++probed;
         if (S.count[i] == 0) continue;
-        lum.push_back(S.accum[i * 3 + 1] / S.count[i]);
+        // Divide by NLAMBDA to match what the tone map actually displays; the
+        // accumulator holds the sum over all wavelengths carried per path.
+        lum.push_back(S.accum[i * 3 + 1] / (double(S.count[i]) * spec::NLAMBDA));
     }
     coverage = probed ? double(lum.size()) / double(probed) : 0.0;
     if (lum.empty()) return 0.0;
@@ -358,14 +364,20 @@ static double meterInitial(const Scene& sc, const CameraParams& cam, double key)
                 Real u1 = hashFloat(hsh), u2 = hashFloat(hashU32(hsh ^ 0x9e3779b9u));
                 Real ul = fract(0.6180339887 * s + hashFloat(hashU32(hsh ^ 0x85ebca6bu)));
                 Rng rng(size_t(y) * w + x + 1, sc.seed + uint64_t(s) * 0x9E3779B97F4A7C15ull);
-                Real lambda = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * ul;
+                Real lam[spec::NLAMBDA];
+                for (int k = 0; k < spec::NLAMBDA; ++k) {
+                    Real f = ul + Real(k) / spec::NLAMBDA; f -= std::floor(f);
+                    lam[k] = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * f;
+                }
                 Real sx = 2.0 * (x + u1) / w - 1.0;
                 Real sy = 1.0 - 2.0 * (y + u2) / h;
                 Geodesic g = c.ray(sx, sy);
-                Real L = tracePath(sc.kerr, sc.disk, sc.sky, sc.prop, g, lambda, rng, sc.maxBounces);
-                if (L > 0) acc += spec::cieXYZ(lambda).y * L;
+                Real rad[spec::NLAMBDA];
+                tracePath(sc.kerr, sc.disk, sc.sky, sc.prop, g, lam, rad, rng, sc.maxBounces);
+                for (int k = 0; k < spec::NLAMBDA; ++k)
+                    if (rad[k] > 0) acc += spec::cieXYZ(lam[k]).y * rad[k];
             }
-            lum.push_back(acc / spp);
+            lum.push_back(acc / (spp * spec::NLAMBDA));
         }
     }
     size_t k = std::min(lum.size() - 1, size_t(lum.size() * 0.99));
@@ -504,7 +516,14 @@ int main(int argc, char** argv) {
     pool.reserve(nThreads);
     for (int i = 0; i < nThreads; ++i) pool.emplace_back(workerLoop, std::ref(S));
 
-    const CameraParams home = S.cam;
+    // The main thread owns the authoritative camera and clock.  S.cam and
+    // S.tObs are published from these only inside reconfigure(), i.e. with
+    // every worker parked -- previously they were mutated in the event handler
+    // while workers were reading them, which was a genuine data race.
+    CameraParams camWanted = S.cam;
+    Real         tWanted   = S.tObs;
+    bool         sceneDirty = false;   // a change is pending publication
+    const CameraParams home = camWanted;
 
     bool  dragOrbit = false, dragPan = false;
     auto  lastInput = Clock::now() - std::chrono::seconds(10);
@@ -537,13 +556,13 @@ int main(int argc, char** argv) {
         // with space to let it converge.
         if (playing) {
             double dtWall = std::min(0.1, since(lastFrame));   // clamp a hitch
-            S.tObs += dtWall * timeScale;
+            tWanted += dtWall * timeScale;
             camChanged = true;
         }
 
         // Scripted motion, so the interactive path can be exercised headlessly.
         if (autoOrbit && since(startTime) < autoQuit * 0.6) {
-            S.cam.phiDeg += 1.5;
+            camWanted.phiDeg += 1.5;
             camChanged = true;
         }
         if (autoQuit > 0 && since(startTime) > autoQuit) {
@@ -587,12 +606,12 @@ int main(int argc, char** argv) {
 
             case SDL_MOUSEMOTION:
                 if (dragOrbit && (e.motion.xrel || e.motion.yrel)) {
-                    S.cam.phiDeg += e.motion.xrel * 0.25;
-                    S.cam.incDeg = clampf(S.cam.incDeg - e.motion.yrel * 0.25, 1.0, 179.0);
+                    camWanted.phiDeg += e.motion.xrel * 0.25;
+                    camWanted.incDeg = clampf(camWanted.incDeg - e.motion.yrel * 0.25, 1.0, 179.0);
                     camChanged = true;
                 } else if (dragPan && (e.motion.xrel || e.motion.yrel)) {
-                    S.cam.yawDeg   = clampf(S.cam.yawDeg   - e.motion.xrel * 0.05, -80.0, 80.0);
-                    S.cam.pitchDeg = clampf(S.cam.pitchDeg + e.motion.yrel * 0.05, -80.0, 80.0);
+                    camWanted.yawDeg   = clampf(camWanted.yawDeg   - e.motion.xrel * 0.05, -80.0, 80.0);
+                    camWanted.pitchDeg = clampf(camWanted.pitchDeg + e.motion.yrel * 0.05, -80.0, 80.0);
                     camChanged = true;
                 }
                 break;
@@ -600,11 +619,11 @@ int main(int argc, char** argv) {
             case SDL_MOUSEWHEEL: {
                 bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
                 if (ctrl) {
-                    S.cam.fovDeg = clampf(S.cam.fovDeg * std::exp(-e.wheel.y * 0.08), 2.0, 120.0);
+                    camWanted.fovDeg = clampf(camWanted.fovDeg * std::exp(-e.wheel.y * 0.08), 2.0, 120.0);
                 } else {
                     Real minR = sc.kerr.horizon() * 2.0 + 1.0;
-                    S.cam.camR = clampf(S.cam.camR * std::exp(-e.wheel.y * 0.10), minR, 4000.0);
-                    sc.prop.rEscape = std::max<Real>(2000.0, S.cam.camR * 8);
+                    camWanted.camR = clampf(camWanted.camR * std::exp(-e.wheel.y * 0.10), minR, 4000.0);
+                    sc.prop.rEscape = std::max<Real>(2000.0, camWanted.camR * 8);
                 }
                 camChanged = true;
                 break;
@@ -613,14 +632,15 @@ int main(int argc, char** argv) {
             case SDL_KEYDOWN:
                 switch (e.key.keysym.sym) {
                 case SDLK_ESCAPE: case SDLK_q: running = false; break;
-                case SDLK_r: S.cam = home; camChanged = true; break;
+                case SDLK_r: camWanted = home; camChanged = true; break;
                 case SDLK_SPACE:
                     playing = !playing;
-                    std::printf("  %s  (t = %.1f M)\n", playing ? "playing" : "paused", double(S.tObs));
+                    std::printf("  %s  (t = %.1f M)\n", playing ? "playing" : "paused", double(tWanted));
                     std::fflush(stdout);
                     lastInput = Clock::now();
                     break;
                 case SDLK_t:
+                    tWanted = 0;
                     reconfigure(S, [&] { S.tObs = 0; resetAccumulation(S); });
                     std::printf("  time reset to 0\n");
                     std::fflush(stdout);
@@ -708,11 +728,27 @@ int main(int argc, char** argv) {
             desiredScale = 1;
         }
 
-        if (camChanged || desiredScale != S.rt.scale) {
+        // Coalesce scene changes until the current one has actually been drawn.
+        //
+        // Resetting on every UI frame is what made an animating disk look
+        // stalled: the display loop runs at 60 Hz while a full pass completes
+        // at ~40 Hz, so the accumulator was wiped before any pass finished and
+        // the frame was permanently about half current and half leftovers.
+        // Waiting for a completed pass means every image shown is a complete
+        // render of one scene state, at the cost of at most one pass of input
+        // latency (~25 ms).  A scale change still applies at once, since the
+        // buffers have to be resized anyway.
+        bool passComplete = S.work.load(std::memory_order_relaxed) >= uint64_t(S.numTiles);
+        if (camChanged) sceneDirty = true;
+
+        if ((sceneDirty && passComplete) || desiredScale != S.rt.scale) {
             reconfigure(S, [&] {
                 S.rt.scale = desiredScale;
+                S.cam  = camWanted;       // published with every worker parked
+                S.tObs = tWanted;
                 resetAccumulation(S);
             });
+            sceneDirty = false;
         }
 
         // --- throughput and exposure --------------------------------------
@@ -758,7 +794,7 @@ int main(int argc, char** argv) {
                 "a=%.2f  r=%.0fM  inc=%.0f  fov=%.0f",
                 moving ? "moving" : "settling", S.rt.scale, S.minCount.load(),
                 fps, raysPerSec / 1e6,
-                sc.kerr.a, double(S.cam.camR), double(S.cam.incDeg), double(S.cam.fovDeg));
+                sc.kerr.a, double(camWanted.camR), double(camWanted.incDeg), double(camWanted.fovDeg));
             SDL_SetWindowTitle(win, title);
             lastTitle = Clock::now();
         }

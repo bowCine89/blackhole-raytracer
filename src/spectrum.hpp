@@ -15,6 +15,19 @@ constexpr Real LAMBDA_MIN = 380e-9;   // m
 constexpr Real LAMBDA_MAX = 780e-9;
 constexpr Real LAMBDA_SPAN = LAMBDA_MAX - LAMBDA_MIN;
 
+// Wavelengths carried per traced path.
+//
+// A single wavelength per pixel makes every sample a saturated colour, and the
+// resulting chromatic speckle is what dominates a one-sample-per-pixel image --
+// the regime the interactive viewer lives in whenever anything is moving.
+//
+// The cure is nearly free here, for a reason specific to this renderer: in
+// general relativity the null geodesic does not depend on wavelength at all.
+// There is no dispersion, so one traced path is valid for every wavelength at
+// once, and carrying several costs only a few extra Planck evaluations against
+// an integration that is already paid for.
+constexpr int NLAMBDA = 4;
+
 constexpr Real H_PLANCK = 6.62607015e-34;   // J s
 constexpr Real C_LIGHT  = 2.99792458e8;     // m/s
 constexpr Real K_BOLTZ  = 1.380649e-23;     // J/K

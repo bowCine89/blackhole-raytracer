@@ -297,8 +297,9 @@ inline void runPacket(const Kerr& kerr, const Disk& disk, const Propagator& prop
 // scalar and reuse the same expressions as the scalar tracer.
 inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
                         const Propagator& prop, Geodesic g[LANES],
-                        const Real lambda0[LANES], Rng rng[LANES],
-                        int maxBounces, int nActive, Real radianceOut[LANES],
+                        const Real lambda0[LANES][spec::NLAMBDA], Rng rng[LANES],
+                        int maxBounces, int nActive,
+                        Real radianceOut[LANES][spec::NLAMBDA],
                         Real tObs = 0, uint64_t* steps = nullptr)
 {
     Real travel[LANES] = {};      // light travel time back from the camera
@@ -306,7 +307,7 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
     int  bounce[LANES], crossings[LANES];
     bool alive[LANES];
     for (int i = 0; i < LANES; ++i) {
-        radianceOut[i] = 0;
+        for (int k = 0; k < spec::NLAMBDA; ++k) radianceOut[i][k] = 0;
         shift[i] = 1; throughput[i] = 1;
         bounce[i] = 0; crossings[i] = 0;
         alive[i] = (i < nActive);
@@ -334,8 +335,9 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
                 Real gs = 1 / nuRatio;
                 Real gs2 = gs * gs, gs5 = gs2 * gs2 * gs;
                 Vec3 dir = asymptoticDirection(kerr, res.yEnd[i], g[i].E, g[i].L);
-                radianceOut[i] += throughput[i] * gs5 *
-                                  sky.radiance(dir, lambda0[i] * gs, bounce[i] == 0);
+                for (int k = 0; k < spec::NLAMBDA; ++k)
+                    radianceOut[i][k] += throughput[i] * gs5 *
+                        sky.radiance(dir, lambda0[i][k] * gs, bounce[i] == 0);
                 alive[i] = false;
                 continue;
             }
@@ -371,7 +373,9 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
             Real gs = 1 / shift[i];
             Real gs2 = gs * gs, gs5 = gs2 * gs2 * gs;
             Real T = disk.temperature(r, ph, tEmit);
-            if (T > 0) radianceOut[i] += throughput[i] * gs5 * spec::planck(lambda0[i] * gs, T);
+            if (T > 0)
+                for (int k = 0; k < spec::NLAMBDA; ++k)
+                    radianceOut[i][k] += throughput[i] * gs5 * spec::planck(lambda0[i][k] * gs, T);
 
             if (bounce[i]++ >= maxBounces) { alive[i] = false; continue; }
             if (rng[i].uniform() >= disk.albedo) { alive[i] = false; continue; }
