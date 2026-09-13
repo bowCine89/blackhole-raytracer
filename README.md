@@ -59,8 +59,10 @@ dependencies.
 A GPU would in principle go faster still, but only with real double-precision
 throughput behind it: geodesic integration near the photon ring genuinely needs
 64-bit floats, and consumer parts typically run FP64 at a small fraction of
-their FP32 rate. On a many-core CPU with full-width SIMD the CPU is the
-straightforward target.
+their FP32 rate. A many-core CPU is the straightforward target.
+
+Note that the speed here comes from threads and from cutting work, **not** from
+vector width — see the ISA measurements below.
 
 ---
 
@@ -233,6 +235,28 @@ Tuning took it from 1.03 to 2.76 Mrays/s — about 64 integration steps per ray 
 | `pow(err,-0.2)` → seeded Newton fifth root | ~5%, image identical to 4×10⁻⁹ mean |
 
 Every tolerance claim above was checked by diffing HDR buffers, not by eye.
+
+### The code does not use AVX-512 (measured)
+
+`-march=native` is worth keeping, but **FMA earns it, not vector width**:
+
+| build | Mrays/s |
+|---|--:|
+| SSE2 only (`-mno-avx -mno-fma`) | 2.39 |
+| `-march=native` | 2.77 |
+| `-march=native -mno-avx512f` | 2.79 |
+
+Turning AVX-512 off changes nothing. Disassembling the hot path shows why:
+`DormandPrince::trial`, where nearly all the time goes, contains **zero** `zmm`
+and `ymm` registers — 285 scalar-double instructions (`vmulsd`, `vfmadd231sd`,
+`vdivsd`) against 68 packed. The `zmm` occurrences elsewhere in the binary are
+in cold code such as image post-processing.
+
+This is the expected result, and it is the same fact as the latency analysis
+below: one ray's Runge-Kutta stages are strictly sequential, so there is nothing
+for the compiler to pack into a wide register. Vector width can only be
+exploited by putting *different rays* in different lanes, which is precisely
+what the packet-tracing work below would do.
 
 **Where the remaining headroom is.** At ~850 cycles per step the code is
 *latency*-bound, not throughput-bound: Dormand–Prince stages are strictly

@@ -19,7 +19,8 @@ if (-not (Test-Path $zig)) {
 
 $flags = @(
     '-std=c++20', '-O3',
-    '-march=native',          # AVX-512 on Zen 4/5; harmless elsewhere
+    '-march=native',          # worth ~16%, and it is FMA that earns it, not
+                              # vector width -- the hot loop is scalar doubles
     '-funroll-loops',
     '-fno-math-errno',        # sin/cos/sqrt need not set errno
     '-fno-trapping-math',
