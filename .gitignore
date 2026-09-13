@@ -1,0 +1,6 @@
+.toolchain/
+.zig-cache/
+*.exe
+*.pdb
+*.pfm
+*.obj
