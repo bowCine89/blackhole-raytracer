@@ -786,7 +786,11 @@ int main(int argc, char** argv) {
             case SDL_MOUSEMOTION:
                 if (mode != Mode::Live) break;   // the sequence assumes a fixed camera
                 if (dragOrbit && (e.motion.xrel || e.motion.yrel)) {
-                    camWanted.phiDeg += e.motion.xrel * 0.25;
+                    // Negated to match the other two axes: screen-right is the
+                    // direction of increasing phi, so orbiting with +xrel swings
+                    // the camera the same way the cursor went and the scene
+                    // parallaxes against it.  Drag should carry the hole with it.
+                    camWanted.phiDeg -= e.motion.xrel * 0.25;
                     camWanted.incDeg = clampf(camWanted.incDeg - e.motion.yrel * 0.25, 1.0, 179.0);
                     camChanged = true;
                 } else if (dragPan && (e.motion.xrel || e.motion.yrel)) {
