@@ -1,10 +1,13 @@
 .toolchain/
 .zig-cache/
 *.exe
+/kerr
+/kerrview
 *.pdb
 *.dll
 *.pfm
 *.obj
+*.o
 kerrview-*.png
 *.avi
 !kerr-orbit.avi

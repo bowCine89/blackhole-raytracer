@@ -75,9 +75,25 @@ Everything above is physical except two clearly-marked knobs: `--turbulence`
 .\kerrview.exe           # interactive viewer
 ```
 
-`build.ps1 cli` or `build.ps1 viewer` builds just one target. Both front ends
-share one tracer: `src/render.hpp` holds the physics, and `main.cpp` and
-`viewer.cpp` only decide which rays to ask for.
+On Linux, `build.sh` is the same build in the other shell, and the binaries
+lose the extension:
+
+```sh
+sudo apt install libsdl2-dev   # the viewer needs it; the batch renderer does not
+./build.sh               # uses clang++ or g++ when installed, else fetches Zig
+./kerr --check
+./kerr --preview
+./kerr
+./kerrview
+```
+
+Read every `.\kerr.exe` below as `./kerr`. Nothing else differs: there is no
+platform-specific code in either front end, and the self-test passes identically
+on both.
+
+`build.ps1 cli` or `build.ps1 viewer` — `./build.sh cli`, `./build.sh viewer` —
+builds just one target. Both front ends share one tracer: `src/render.hpp` holds
+the physics, and `main.cpp` and `viewer.cpp` only decide which rays to ask for.
 
 Any recent Clang or GCC works instead:
 
@@ -89,7 +105,7 @@ g++     -std=c++20 -O3 -march=native src/main.cpp -o kerr
 Do **not** add `-ffast-math`: the integrator uses `isfinite()` to reject bad
 trial steps, and `-ffinite-math-only` compiles those checks away.
 
-If Windows reports *"an application control policy has blocked this file"*,
+On Windows, if it reports *"an application control policy has blocked this file"*,
 Smart App Control is in enforcement mode and is refusing to run a freshly
 written unsigned binary. `build.ps1` works around it by linking to a scratch
 name and copying into place; if you compile by hand and hit it, copy the output
@@ -99,9 +115,9 @@ to a new filename and run that.
 
 ## The interactive viewer
 
-`kerrview.exe` drives the same path tracer in real time. Orbit with the left
-mouse button, pan with the right, dolly with the wheel, and the image keeps
-refining for as long as you leave it alone.
+`kerrview.exe`, or `./kerrview`, drives the same path tracer in real time.
+Orbit with the left mouse button, pan with the right, dolly with the wheel, and
+the image keeps refining for as long as you leave it alone.
 
 ```
 SPACE         bake an animation -> play it -> live   ESC     back out
@@ -329,7 +345,7 @@ The physics is identical — the same `tracePath`, the same validated integrator
 The viewer omits bloom (a whole-image post pass, not tile-local) and tone maps
 each pixel as its tile is traced, using an exposure that is sampled sparsely and
 smoothed over time so the picture does not pulse as samples arrive. For a final
-image, use `kerr.exe`.
+image, use the batch renderer.
 
 ---
 

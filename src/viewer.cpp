@@ -598,6 +598,13 @@ int main(int argc, char** argv) {
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, winW, winH,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    // Falling back to whatever renderer exists costs nothing here and is the
+    // difference between running and not on a machine with no GPU path: X11
+    // without GLX, a VM with 3D disabled, a plain SDL dummy driver.  There is
+    // no GPU work to lose -- the frame is a CPU-side buffer that gets uploaded
+    // once per present either way.  On Windows this never triggers, because
+    // Direct3D is always there to be found.
+    if (win && !ren) ren = SDL_CreateRenderer(win, -1, 0);
     if (!win || !ren) {
         std::fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError());
         SDL_Quit();

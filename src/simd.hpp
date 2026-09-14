@@ -46,7 +46,18 @@ static inline vd vabs(vd x)  { return vbits(ibits(x) & isplat(0x7fffffffffffffff
 static inline vd vneg(vd x)  { return vbits(ibits(x) ^ isplat(int64_t(0x8000000000000000ULL))); }
 static inline vd vmin(vd a, vd b) { return vsel(a < b, a, b); }
 static inline vd vmax(vd a, vd b) { return vsel(a > b, a, b); }
+// __builtin_elementwise_sqrt is a Clang extension with no GCC counterpart, so
+// GCC gets a lanewise loop instead.  Both spellings compile to one vsqrtpd per
+// register at -O3 -- the loop is a different way of writing it, not a slow path.
+#if defined(__clang__)
 static inline vd vsqrt(vd x) { return __builtin_elementwise_sqrt(x); }
+#else
+static inline vd vsqrt(vd x) {
+    vd r;
+    for (int i = 0; i < LANES; ++i) r[i] = __builtin_sqrt(x[i]);
+    return r;
+}
+#endif
 
 static inline bool anyTrue(vi m) {
     long long acc = 0;
