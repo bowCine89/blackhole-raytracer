@@ -73,6 +73,12 @@ static inline void geodesicRhsV(const PacketConst& c, const PacketState& s, Pack
 // ---------------------------------------------------------------------------
 // Dormand-Prince 5(4) across eight lanes, each with its own step size
 // ---------------------------------------------------------------------------
+// The tableau, the dense-output coefficients and the right-hand side below are
+// deliberate duplicates of the scalar ones in kerr.hpp -- there is no shared
+// source, so nothing makes the compiler notice if one is edited and the other
+// is not.  What guards that is the packet-vs-scalar pair in --check, which
+// traces the same 4096 rays down both paths and compares outcomes.  Change a
+// coefficient here and that check is what will tell you.
 struct PacketDP {
     vd rtol = vsplat(1e-6), atol = vsplat(1e-12);
     vd hMin = vsplat(1e-10);

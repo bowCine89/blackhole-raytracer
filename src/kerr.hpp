@@ -74,8 +74,8 @@ struct Geodesic {
     Real E = 1, L = 0;             // conserved -p_t and p_phi
 };
 
-// The five-component state the integrator advances.
-// Six components: r, theta, phi, p_r, p_theta, t.
+// The six-component state the integrator advances:
+// r, theta, phi, p_r, p_theta, t.
 //
 // Coordinate time rides along so that the *emission time* at a disk hit is
 // known.  Light from the far side of the disk, and from the lensed images that

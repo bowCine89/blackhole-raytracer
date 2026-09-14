@@ -496,7 +496,11 @@ The effective temperature follows from $F = \sigma T^4$:
 
 $$T(r) = \left(F(r)/\sigma\right)^{1/4},$$
 
-normalised so the peak is `--tpeak`. With the defaults that is 9000 K near
+normalised so the peak of the profile is `--tpeak`. The mottling is applied on
+top of it, as $T \times (1 + \texttt{turbulence} \cdot d)$ with $d \in [-1, 1]$, so
+with the default `--turbulence 0.15` the hottest patches run about 15% above that
+figure; `--turbulence 0` makes the peak exactly `--tpeak`. With the defaults the
+profile peaks at 9000 K near
 $r \approx 3M$ falling to about 3600 K at the outer edge — a factor $\sim 150$ in
 visible radiance, which is why the disk runs from white-hot to dull orange along
 its length.
@@ -845,7 +849,14 @@ its own output:
   ...and differs at half a period                     3.985e-03
   loop mode returns to its start at every radius      3.419e-16
   ...while still moving inside the loop               2.787e-03
+  light travel time, radial ray r=20 to 1000         995.021629
+  vsincos vs libm over theta in (0,pi)                1.110e-15
+  packet vs scalar: outcome disagreements               0.0000%
+  packet vs scalar: max rel. difference in r          6.166e-12
 ```
+
+The last two are what licences the packet tracer: they hold the vectorised
+path to the scalar one in [Is the packet path actually the same tracer?](#is-the-packet-path-actually-the-same-tracer).
 
 The two strongest are end-to-end.
 

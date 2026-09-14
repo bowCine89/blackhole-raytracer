@@ -520,6 +520,8 @@ static void usage() {
 "  --tpeak K                   peak effective temperature      (9000)\n"
 "  --albedo A                  disk scattering albedo          (0.20)\n"
 "  --turbulence F              cosmetic mottling, 0 = pure NT  (0.15)\n"
+"  --edge W                    optical-depth e-folding width   (1.2)\n"
+"  --tau T                     interior optical-depth cap      (30)\n"
 "\n"
 "Sky\n"
 "  --sky-gain F                star brightness                 (0.20)\n"
@@ -529,7 +531,7 @@ static void usage() {
 "\n"
 "Tone mapping\n"
 "  --exposure F                exposure multiplier             (1.0)\n"
-"  --key F                     target level for the bright end (2.2)\n"
+"  --key F                     target level for the bright end (1.3)\n"
 "  --bloom F                   bloom strength, 0 disables      (0.16)\n"
 "  --desat F                   highlight desaturation          (0.85)\n"
 "\n"
@@ -550,6 +552,8 @@ static void usage() {
 "Other\n"
 "  --preview                   fast low-resolution settings\n"
 "  --check                     run the geodesic self-test and exit\n"
+"  --stats                     per-pixel step and ray statistics\n"
+"  --no-simd                   scalar tracing instead of 8-wide packets\n"
 "  --quiet, --help\n");
 }
 
