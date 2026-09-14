@@ -8,6 +8,7 @@
 #include "kerr.hpp"
 #include "spectrum.hpp"
 #include "scene.hpp"
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Geodesic propagation
@@ -25,7 +26,15 @@ struct Propagator {
 
     // Advance the geodesic until it terminates.  On a disk hit, yEnd holds the
     // state interpolated exactly onto the equatorial plane.
-    Term run(const Geodesic& g, State& yEnd, uint64_t* stepsOut = nullptr) const {
+    //
+    // pathOut, when given, collects the Boyer-Lindquist position (r, theta, phi)
+    // at the start and after every accepted step.  It exists for the viewer's
+    // ray visualiser and is null on every rendering path, where it costs one
+    // perfectly-predicted branch per step.  The terminal point is not appended:
+    // the caller has it in yEnd, and on a disk hit that is the interpolated
+    // crossing rather than the last accepted step.
+    Term run(const Geodesic& g, State& yEnd, uint64_t* stepsOut = nullptr,
+             std::vector<Vec3>* pathOut = nullptr) const {
         DormandPrince dp;
         dp.rtol = rtol;
 
@@ -46,6 +55,7 @@ struct Propagator {
 
         Real h = capFor(y, dp.k1);
         int rejects = 0;
+        if (pathOut) pathOut->push_back({y.y[0], y.y[1], y.y[2]});
 
         int step = 0;
         struct StepTally { uint64_t* out; int* n; ~StepTally() { if (out) *out += uint64_t(*n); } } tally{stepsOut, &step};
@@ -94,6 +104,7 @@ struct Propagator {
             }
 
             y = yn;
+            if (pathOut) pathOut->push_back({y.y[0], y.y[1], y.y[2]});
             dp.k1 = dp.k7;                                   // FSAL
             h = DormandPrince::nextStep(h, err, dp.hMin, cap);
 

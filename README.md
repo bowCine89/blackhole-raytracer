@@ -129,8 +129,48 @@ right drag    pan the aim point                      , / .   disk radius (speed)
 wheel         dolly in/out                           - / =   exposure
 ctrl+wheel    field of view                          b       scattering bounces
 r             reset camera                           s       save PNG(s)
-                                                     q       quit
+g             3D ray view (see below)                q       quit
 ```
+
+### Seeing the rays
+
+The rendered image is an integral; `g` shows you the integrand. It freezes the
+camera, traces a sparse grid of the rays that camera is casting, and draws them
+as a wireframe you can orbit around. The trajectories stay pinned to the
+viewpoint they were launched from, so dragging moves your eye and not theirs —
+which is the only arrangement in which you can walk around a bundle of geodesics
+and see its shape.
+
+![Rays cast by the camera, bending around the hole](out/rays.png)
+
+Colour is the outcome, which is the same classification that decides what the
+final image looks like: **blue** escapes to the star field, **amber** lands on
+the disk, **red** falls through the horizon. The white cross is the camera the
+rays were launched from. What is worth looking for is the rays that leave
+heading nowhere near the hole and are turned onto it anyway, and the amber ones
+that reach the disk from *underneath* after passing the far side — those are the
+lensed images the front view cannot explain.
+
+```
+g                    enter and leave the ray view
+left drag / wheel    orbit and dolly the inspection camera
+[ / ]                fewer / more rays
+s                    save the diagram to kerrview-rays.png
+ESC                  back to the traced view
+```
+
+`--autorays` opens it at startup. Leaving restores the camera you entered with,
+so the view costs nothing.
+
+Two honest caveats. The rays are integrated to the same tolerance as the render,
+but escaping ones are cut off a little beyond the camera radius so the picture
+stays about the hole rather than about a sphere of radius 2000. And the
+inspection camera draws *straight* lines between points in the
+oblate-spheroidal embedding $(\sqrt{r^2+a^2}\sin\theta\cos\phi,\;
+\sqrt{r^2+a^2}\sin\theta\sin\phi,\; r\cos\theta)$ — the embedding is a
+drawing convention, not a geometry, so what you are seeing is where the ray goes
+in these coordinates, not a picture of curved space. The curvature you can see
+is real; the flat space it appears to curve through is not.
 
 The disk does not turn *live*, and cannot: a rotating disk changes faster than
 the tracer converges, so an animating viewer would be pinned at one sample per

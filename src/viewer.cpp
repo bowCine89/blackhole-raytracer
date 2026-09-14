@@ -431,13 +431,231 @@ static double meterInitial(const Scene& sc, const CameraParams& cam, double key)
 //     PLAYING  -> space returns to live
 //
 // Escape backs out of whatever is happening without quitting.
-enum class Mode { Live, Baking, Playing };
+enum class Mode { Live, Baking, Playing, Rays };
 
 static const char* modeName(Mode m) {
     switch (m) {
         case Mode::Baking:  return "BAKING";
         case Mode::Playing: return "PLAYING";
+        case Mode::Rays:    return "RAYS";
         default:            return "live";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ray visualiser
+// ---------------------------------------------------------------------------
+//
+// G stops the tracer and shows the geometry it was working in.  A sparse grid
+// of the camera's own rays is integrated once and kept as polylines; dragging
+// then moves *your* eye around them, not theirs -- the rays stay pinned to the
+// viewpoint they were launched from, which is the whole point.  Watching a ray
+// wind twice around the photon ring and come back out explains the picture in a
+// way the picture cannot.
+//
+// The rays are traced backwards, as the renderer traces them: they leave the
+// camera and run out into the spacetime.  Colour is the outcome, which is
+// exactly the classification that makes the final image what it is.
+
+// Boyer-Lindquist to Cartesian, in the oblate-spheroidal embedding that goes
+// with these coordinates: surfaces of constant r are ellipsoids of semi-axis
+// sqrt(r^2 + a^2) across and r along the spin axis, so the horizon shows its
+// true flattening rather than being drawn as a sphere it is not.
+static Vec3 blToCart(Real r, Real th, Real ph, Real a) {
+    Real s = std::sin(th), c = std::cos(th);
+    Real rho = std::sqrt(r * r + a * a);
+    return { rho * s * std::cos(ph), rho * s * std::sin(ph), r * c };
+}
+
+struct RayLine {
+    std::vector<Vec3> pts;
+    Term end = Term::Escaped;
+};
+
+struct RayVis {
+    std::vector<RayLine> lines;
+    Vec3   target{0, 0, 0};       // what the inspection camera orbits
+    CameraParams source;          // the viewpoint the rays were launched from
+    Real   sourceA = 0;
+    Real   rHorizon = 2, rIn = 6, rOut = 18;
+    int    gridX = 13, gridY = 7;
+    bool   captured = false;
+};
+
+// An ordinary pinhole camera in the embedding space.  Nothing here is a
+// geodesic: we are looking *at* the spacetime from outside it, so straight
+// lines are the honest choice and curvature belongs to what is being drawn.
+struct ViewCam {
+    Vec3 eye, fwd, right, up;
+    Real tanHalf = 1, aspect = 1;
+    ViewCam(const CameraParams& p, Real aspectIn, Vec3 target = {0, 0, 0}) {
+        Real th = p.incDeg * PI / 180, ph = p.phiDeg * PI / 180;
+        eye = target + Vec3{ p.camR * std::sin(th) * std::cos(ph),
+                             p.camR * std::sin(th) * std::sin(ph),
+                             p.camR * std::cos(th) };
+        fwd = normalize(target - eye);
+        Vec3 wup{0, 0, 1};
+        if (std::fabs(dot(fwd, wup)) > 0.999) wup = Vec3{0, 1, 0};
+        right = normalize(cross(fwd, wup));
+        up    = normalize(cross(right, fwd));
+        tanHalf = std::tan(0.5 * clampf(p.fovDeg, 5.0, 120.0) * PI / 180);
+        aspect  = aspectIn;
+    }
+    // Returns false behind the eye; depth comes back in z for near-plane clipping.
+    bool project(const Vec3& p, Real& sx, Real& sy, Real& z) const {
+        Vec3 d = p - eye;
+        z = dot(d, fwd);
+        if (z <= 1e-4) return false;
+        sx = dot(d, right) / (z * tanHalf * aspect);
+        sy = dot(d, up)    / (z * tanHalf);
+        return true;
+    }
+};
+
+// One segment, clipped against the near plane so a polyline that passes behind
+// the eye does not wrap across the screen.
+static void drawSeg(SDL_Renderer* ren, const ViewCam& vc, int w, int h,
+                    Vec3 a, Vec3 b) {
+    const Real near = 1e-3;
+    Real za = dot(a - vc.eye, vc.fwd), zb = dot(b - vc.eye, vc.fwd);
+    if (za <= near && zb <= near) return;
+    if (za <= near) { Real t = (near - za) / (zb - za); a = a + (b - a) * t; }
+    if (zb <= near) { Real t = (near - zb) / (za - zb); b = b + (a - b) * t; }
+    Real ax, ay, az, bx, by, bz;
+    if (!vc.project(a, ax, ay, az) || !vc.project(b, bx, by, bz)) return;
+    auto px = [&](Real sx) { return int((sx + 1) * 0.5 * w); };
+    auto py = [&](Real sy) { return int((1 - sy) * 0.5 * h); };
+    SDL_RenderDrawLine(ren, px(ax), py(ay), px(bx), py(by));
+}
+
+static void drawCircle(SDL_Renderer* ren, const ViewCam& vc, int w, int h,
+                       Real radius, Real zHeight, int segs = 96) {
+    Vec3 prev{radius, 0, zHeight};
+    for (int i = 1; i <= segs; ++i) {
+        Real t = TWO_PI * i / segs;
+        Vec3 cur{radius * std::cos(t), radius * std::sin(t), zHeight};
+        drawSeg(ren, vc, w, h, prev, cur);
+        prev = cur;
+    }
+}
+
+// Trace the grid once.  Escapes are cut off a little beyond the camera so the
+// picture stays about the hole rather than about a sphere of radius 2000.
+static void captureRays(RayVis& rv, const Scene& sc, const CameraParams& cam) {
+    rv.lines.clear();
+    rv.source   = cam;
+    rv.sourceA  = sc.kerr.a;
+    rv.rHorizon = sc.kerr.horizon();
+    rv.rIn      = sc.disk.rIn;
+    rv.rOut     = sc.disk.rOut;
+    // Aim at a point between the hole and the launch site so both stay framed.
+    rv.target   = blToCart(cam.camR, cam.incDeg * PI / 180,
+                           cam.phiDeg * PI / 180, sc.kerr.a) * 0.42;
+
+    Camera camera(sc.kerr, cam);
+    Propagator prop = sc.prop;
+    prop.rEscape = cam.camR * 2.4;
+    prop.maxSteps = 20000;
+
+    std::vector<Vec3> bl;
+    for (int j = 0; j < rv.gridY; ++j)
+        for (int i = 0; i < rv.gridX; ++i) {
+            Real sx = 2.0 * (i + 0.5) / rv.gridX - 1.0;
+            Real sy = 1.0 - 2.0 * (j + 0.5) / rv.gridY;
+            Geodesic g = camera.ray(sx, sy);
+            State yEnd{};
+            bl.clear();
+            Term t = prop.run(g, yEnd, nullptr, &bl);
+
+            RayLine rl;
+            rl.end = t;
+            rl.pts.reserve(bl.size() + 1);
+            for (const Vec3& q : bl) rl.pts.push_back(blToCart(q.x, q.y, q.z, rv.sourceA));
+            rl.pts.push_back(blToCart(yEnd.y[0], yEnd.y[1], yEnd.y[2], rv.sourceA));
+            rv.lines.push_back(std::move(rl));
+        }
+    rv.captured = true;
+}
+
+// Where to stand when the ray view opens.  Staying exactly where the rays were
+// launched is faithful but useless: every trajectory leaves the eye, so the
+// first frame is a starburst and nothing about the geometry is visible.
+// Stepping off the launch axis and pulling back shows the bundle side-on, which
+// is the picture worth having; dragging from there does the rest.
+static CameraParams inspectionPose(const CameraParams& source) {
+    CameraParams v = source;
+    v.incDeg = clampf(source.incDeg > 90 ? source.incDeg - 40 : source.incDeg + 40, 8.0, 172.0);
+    v.phiDeg = source.phiDeg + 30;
+    v.camR   = source.camR * 1.5;
+    v.fovDeg = 55;
+    v.yawDeg = v.pitchDeg = 0;
+    return v;
+}
+
+static void drawRayVis(SDL_Renderer* ren, const RayVis& rv,
+                       const CameraParams& view, int w, int h) {
+    SDL_SetRenderDrawColor(ren, 6, 7, 10, 255);
+    SDL_RenderClear(ren);
+    ViewCam vc(view, Real(w) / Real(std::max(1, h)), rv.target);
+
+    // Equatorial grid: the disk between rIn and rOut, then a few rings beyond
+    // it for scale.  Drawn first so the rays read on top of it.
+    SDL_SetRenderDrawColor(ren, 122, 88, 44, 255);
+    for (int i = 0; i <= 6; ++i)
+        drawCircle(ren, vc, w, h, rv.rIn + (rv.rOut - rv.rIn) * i / 6.0, 0.0);
+    SDL_SetRenderDrawColor(ren, 52, 52, 64, 255);
+    for (int k = 1; k <= 3; ++k)
+        drawCircle(ren, vc, w, h, rv.rOut + k * (rv.rOut - rv.rIn) * 0.5, 0.0);
+    // Spokes, so rotation about the axis is readable.
+    SDL_SetRenderDrawColor(ren, 92, 68, 36, 255);
+    for (int k = 0; k < 12; ++k) {
+        Real t = TWO_PI * k / 12;
+        drawSeg(ren, vc, w, h,
+                Vec3{rv.rIn * std::cos(t), rv.rIn * std::sin(t), 0},
+                Vec3{rv.rOut * std::cos(t), rv.rOut * std::sin(t), 0});
+    }
+
+    // The horizon, as the oblate surface it actually is.
+    SDL_SetRenderDrawColor(ren, 120, 120, 140, 255);
+    const Real rh = rv.rHorizon, a = rv.sourceA;
+    for (int m = 0; m < 12; ++m) {                       // meridians
+        Real ph = PI * m / 12;
+        Vec3 prev = blToCart(rh, 0.0, ph, a);
+        for (int i = 1; i <= 48; ++i) {
+            Vec3 cur = blToCart(rh, PI * i / 48, ph, a);
+            drawSeg(ren, vc, w, h, prev, cur);
+            prev = cur;
+        }
+    }
+    for (int l = 1; l < 8; ++l) {                        // parallels
+        Real th = PI * l / 8;
+        Real rr = std::sqrt(rh * rh + a * a) * std::sin(th);
+        drawCircle(ren, vc, w, h, rr, rh * std::cos(th), 48);
+    }
+
+    // The rays, coloured by how each one ended.
+    for (const RayLine& rl : rv.lines) {
+        switch (rl.end) {
+            case Term::Captured: SDL_SetRenderDrawColor(ren, 232,  72,  60, 255); break;
+            case Term::Disk:     SDL_SetRenderDrawColor(ren, 255, 176,  64, 255); break;
+            case Term::Escaped:  SDL_SetRenderDrawColor(ren, 120, 190, 255, 255); break;
+            default:             SDL_SetRenderDrawColor(ren, 110, 110, 110, 255); break;
+        }
+        for (size_t i = 1; i < rl.pts.size(); ++i)
+            drawSeg(ren, vc, w, h, rl.pts[i - 1], rl.pts[i]);
+    }
+
+    // Where the rays came from.
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+    Vec3 src = blToCart(rv.source.camR, rv.source.incDeg * PI / 180,
+                        rv.source.phiDeg * PI / 180, rv.sourceA);
+    Real mx, my, mz;
+    if (vc.project(src, mx, my, mz)) {
+        int cx = int((mx + 1) * 0.5 * w), cy = int((1 - my) * 0.5 * h);
+        for (int d = -5; d <= 5; ++d) {
+            SDL_RenderDrawPoint(ren, cx + d, cy);
+            SDL_RenderDrawPoint(ren, cx, cy + d);
+        }
     }
 }
 
@@ -480,6 +698,23 @@ static bool writeBakeVideo(const Bake& bake, int w, int h) {
     return true;
 }
 
+// Read the rendered view straight back off the renderer.  The ray visualiser
+// draws with SDL primitives rather than into a pixel buffer, so this is the only
+// way to get a picture of it out.
+static bool savePresented(SDL_Renderer* ren, int w, int h, const std::string& path) {
+    std::vector<uint8_t> rgba(size_t(w) * h * 4);
+    if (SDL_RenderReadPixels(ren, nullptr, SDL_PIXELFORMAT_ABGR8888,
+                             rgba.data(), w * 4) != 0)
+        return false;
+    std::vector<uint8_t> rgb(size_t(w) * h * 3);
+    for (size_t i = 0; i < size_t(w) * h; ++i) {
+        rgb[i * 3 + 0] = rgba[i * 4 + 0];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    return img::writePng(path, w, h, rgb);
+}
+
 static void printControls() {
     std::printf(
 "\nControls\n"
@@ -494,6 +729,7 @@ static void printControls() {
 "  , / .                disk outer radius   (playback speed while playing)\n"
 "  - / =                exposure\n"
 "  b                    cycle scattering bounces (0-4)\n"
+"  g                    3D ray view: see the geodesics this camera casts\n"
 "  r                    reset the camera\n"
 "  s                    save a PNG snapshot\n"
 "  q                    quit\n"
@@ -524,6 +760,7 @@ int main(int argc, char** argv) {
     std::string videoOut = "kerrbake.avi";
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
+    bool   autoRays  = false;   // scripted: open the ray view straight away
     int    autoBake = 0;        // scripted: bake N frames, play, then quit
     double userExposure = 1.0, key = 1.3;
     int threads = 0;
@@ -562,6 +799,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
         else if (a == "--autoorbit")  autoOrbit = true;
+        else if (a == "--autorays")   autoRays = true;
         else if (a == "--rtol")       sc.prop.rtol = nextF();
         else if (a == "--help" || a == "-h") {
             std::printf(
@@ -571,7 +809,8 @@ int main(int argc, char** argv) {
 "  --dist R --inc DEG --fov DEG                  (40, 80, 40)\n"
 "  --rin R --rout R --tpeak K --albedo A --edge W --turbulence F\n"
 "  --bounces N --sky-gain F --nostars\n"
-"  --exposure F --fps F --threads N --rtol F\n");
+"  --exposure F --fps F --threads N --rtol F\n"
+"  --autorays             open the 3D ray view at startup\n");
             printControls();
             return 0;
         }
@@ -645,7 +884,8 @@ int main(int argc, char** argv) {
     Real         tWanted   = S.tObs;
     bool         sceneDirty = false;   // a change is pending publication
 
-    Mode mode = Mode::Live;
+    Mode   mode = Mode::Live;
+    RayVis rayVis;
     Bake bake;
     bake.targetSpp = bakeSpp;
     bake.videoPath = videoOut;
@@ -709,6 +949,15 @@ int main(int argc, char** argv) {
         // frame of a sequence can be taken to full convergence: see
         // `kerr.exe --frames`.
 
+        // Scripted ray view, so it can be exercised without a hand on the mouse.
+        if (autoRays && mode == Mode::Live && !rayVis.captured && since(startTime) > 0.4) {
+            reconfigure(S, [&] { captureRays(rayVis, sc, camWanted); });
+            camWanted = inspectionPose(rayVis.source);
+            mode = Mode::Rays;
+            std::printf("  [auto] ray view: %zu trajectories\n", rayVis.lines.size());
+            std::fflush(stdout);
+        }
+
         // Scripted bake, so the workflow can be exercised headlessly.
         if (autoBake > 0) {
             if (mode == Mode::Live && since(startTime) > 0.4) {
@@ -745,9 +994,15 @@ int main(int argc, char** argv) {
                 copy = bake.frames[std::min(bake.frames.size() - 1, size_t(bake.playHead))];
             else
                 reconfigure(S, [&] { copy = moving ? S.present : S.display; });
-            img::writePng("kerrview-auto.png", winW, winH, copy);
-            std::printf("  autoquit: wrote kerrview-auto.png at %u spp, scale 1/%d, %.2f Mrays/s\n",
-                        S.minCount.load(), S.rt.scale, raysPerSec / 1e6);
+            if (mode == Mode::Rays) {
+                savePresented(ren, winW, winH, "kerrview-rays.png");
+                std::printf("  autoquit: wrote kerrview-rays.png, %zu trajectories\n",
+                            rayVis.lines.size());
+            } else {
+                img::writePng("kerrview-auto.png", winW, winH, copy);
+                std::printf("  autoquit: wrote kerrview-auto.png at %u spp, scale 1/%d, %.2f Mrays/s\n",
+                            S.minCount.load(), S.rt.scale, raysPerSec / 1e6);
+            }
             running = false;
         }
 
@@ -784,7 +1039,9 @@ int main(int argc, char** argv) {
                 break;
 
             case SDL_MOUSEMOTION:
-                if (mode != Mode::Live) break;   // the sequence assumes a fixed camera
+                // Rays mode orbits the inspection camera; baking and playback
+                // assume a fixed one.
+                if (mode != Mode::Live && mode != Mode::Rays) break;
                 if (dragOrbit && (e.motion.xrel || e.motion.yrel)) {
                     // Negated to match the other two axes: screen-right is the
                     // direction of increasing phi, so orbiting with +xrel swings
@@ -801,7 +1058,7 @@ int main(int argc, char** argv) {
                 break;
 
             case SDL_MOUSEWHEEL: {
-                if (mode != Mode::Live) break;
+                if (mode != Mode::Live && mode != Mode::Rays) break;
                 bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
                 if (ctrl) {
                     camWanted.fovDeg = clampf(camWanted.fovDeg * std::exp(-e.wheel.y * 0.08), 2.0, 120.0);
@@ -854,6 +1111,15 @@ int main(int argc, char** argv) {
 
                 // Escape backs out of whatever is happening, without quitting.
                 case SDLK_ESCAPE:
+                    if (mode == Mode::Rays) {
+                        mode = Mode::Live;
+                        camWanted = rayVis.source;
+                        camChanged = true;
+                        std::printf("  rays: back to live\n");
+                        std::fflush(stdout);
+                        lastInput = Clock::now();
+                        break;
+                    }
                     if (mode != Mode::Live) {
                         mode = Mode::Live;
                         tWanted = bake.t0;
@@ -864,8 +1130,38 @@ int main(int argc, char** argv) {
                     }
                     break;
                 case SDLK_r: camWanted = home; camChanged = true; break;
+                case SDLK_g:
+                    if (mode == Mode::Live) {
+                        // Capture with the workers parked: the scene is only
+                        // safe to read while nothing is tracing it.
+                        reconfigure(S, [&] { captureRays(rayVis, sc, camWanted); });
+                        camWanted = inspectionPose(rayVis.source);
+                        mode = Mode::Rays;
+                        std::printf("  rays: %zu trajectories from r = %.1f M, inc %.0f deg"
+                                    "  (drag to orbit, [ / ] density, G or ESC to return)\n",
+                                    rayVis.lines.size(), double(camWanted.camR),
+                                    double(camWanted.incDeg));
+                        std::fflush(stdout);
+                    } else if (mode == Mode::Rays) {
+                        mode = Mode::Live;
+                        camWanted = rayVis.source;   // leave the view as we found it
+                        camChanged = true;
+                        std::printf("  rays: back to live\n");
+                        std::fflush(stdout);
+                    }
+                    break;
                 case SDLK_LEFTBRACKET:
                 case SDLK_RIGHTBRACKET: {
+                    if (mode == Mode::Rays) {
+                        int d = (e.key.keysym.sym == SDLK_RIGHTBRACKET) ? 2 : -2;
+                        rayVis.gridX = std::max(3, std::min(41, rayVis.gridX + d));
+                        rayVis.gridY = std::max(3, std::min(23, rayVis.gridY + (d > 0 ? 1 : -1)));
+                        reconfigure(S, [&] { captureRays(rayVis, sc, rayVis.source); });
+                        std::printf("  rays: %d x %d = %zu trajectories\n",
+                                    rayVis.gridX, rayVis.gridY, rayVis.lines.size());
+                        std::fflush(stdout);
+                        break;
+                    }
                     if (mode != Mode::Live) break;
                     Real d = (e.key.keysym.sym == SDLK_RIGHTBRACKET) ? 0.02 : -0.02;
                     reconfigure(S, [&] {
@@ -914,6 +1210,14 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case SDLK_s: {
+                    if (mode == Mode::Rays) {
+                        if (savePresented(ren, winW, winH, "kerrview-rays.png"))
+                            std::printf("  wrote kerrview-rays.png\n");
+                        else
+                            std::printf("  could not read the framebuffer back: %s\n", SDL_GetError());
+                        std::fflush(stdout);
+                        break;
+                    }
                     // During playback, save the whole baked sequence -- having
                     // just watched it, that is obviously what "save" means.
                     if (mode == Mode::Playing && !bake.frames.empty()) {
@@ -983,7 +1287,7 @@ int main(int argc, char** argv) {
         // Playback needs no rays at all, so park the workers rather than leave
         // 31 threads spinning on an image nobody is looking at.
         {
-            bool wantIdle = (mode == Mode::Playing);
+            bool wantIdle = (mode == Mode::Playing || mode == Mode::Rays);
             std::unique_lock<std::mutex> lk(S.mtx);
             if (S.idle != wantIdle) { S.idle = wantIdle; lk.unlock(); S.cv.notify_all(); }
         }
@@ -1021,7 +1325,7 @@ int main(int argc, char** argv) {
         // latency (~25 ms).  A scale change still applies at once, since the
         // buffers have to be resized anyway.
         bool passComplete = S.work.load(std::memory_order_relaxed) >= uint64_t(S.numTiles);
-        if (camChanged) sceneDirty = true;
+        if (camChanged && mode != Mode::Rays) sceneDirty = true;
 
         if ((passComplete && (sceneDirty || moving)) || desiredScale != S.rt.scale) {
             reconfigure(S, [&] {
@@ -1086,15 +1390,21 @@ int main(int argc, char** argv) {
             // Playback shows a baked frame; otherwise the last complete pass
             // while moving, or the live buffer while settled so refinement is
             // visible as it happens.
-            const uint8_t* src;
-            if (mode == Mode::Playing && !bake.frames.empty()) {
-                size_t i = std::min(bake.frames.size() - 1, size_t(bake.playHead));
-                src = bake.frames[i].data();
+            // The visualiser draws vectors rather than a frame buffer, so it
+            // bypasses the streaming texture entirely.
+            if (mode == Mode::Rays) {
+                drawRayVis(ren, rayVis, camWanted, winW, winH);
             } else {
-                src = moving ? S.present.data() : S.display.data();
+                const uint8_t* src;
+                if (mode == Mode::Playing && !bake.frames.empty()) {
+                    size_t i = std::min(bake.frames.size() - 1, size_t(bake.playHead));
+                    src = bake.frames[i].data();
+                } else {
+                    src = moving ? S.present.data() : S.display.data();
+                }
+                SDL_UpdateTexture(tex, nullptr, src, winW * 3);
+                SDL_RenderCopy(ren, tex, nullptr, nullptr);
             }
-            SDL_UpdateTexture(tex, nullptr, src, winW * 3);
-            SDL_RenderCopy(ren, tex, nullptr, nullptr);
             SDL_RenderPresent(ren);
             lastPresent = Clock::now();
 
@@ -1132,6 +1442,13 @@ int main(int argc, char** argv) {
                     bake.frames.size() + 1, bake.maxFrames,
                     S.minCount.load(), bake.targetSpp,
                     double(bake.span() / period), bake.bytes() / 1.0e6);
+                break;
+            case Mode::Rays:
+                std::snprintf(title, sizeof title,
+                    "RAYS  |  %zu trajectories  |  %d x %d  |  from r=%.0fM inc=%.0f  |  "
+                    "drag to orbit  |  G: back to live",
+                    rayVis.lines.size(), rayVis.gridX, rayVis.gridY,
+                    double(rayVis.source.camR), double(rayVis.source.incDeg));
                 break;
             case Mode::Playing:
                 std::snprintf(title, sizeof title,
