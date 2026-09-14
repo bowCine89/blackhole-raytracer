@@ -173,11 +173,13 @@ if [ "$target" = 'all' ] || [ "$target" = 'viewer' ]; then
         exit 1
     fi
     # Debian and Ubuntu split the headers: the generated SDL_config.h lives in
-    # the multiarch include directory and the plain one only forwards to it.
-    # Neither pkg-config nor sdl2-config mentions that directory -- a system
-    # clang or gcc happens to search it anyway, but `zig c++` does not, and the
-    # build then dies on <SDL2/_real_SDL_config.h>.  Look for it next to each
-    # include directory we were handed, rather than assuming /usr.
+    # the multiarch include directory and the plain one only forwards to it, so
+    # <SDL2/_real_SDL_config.h> has to be reachable or nothing compiles.
+    # Neither pkg-config nor sdl2-config names that directory.  A compiler that
+    # knows the distribution adds it on its own -- `zig c++` does, once it
+    # exists -- so a packaged SDL2 needs nothing from this loop; an SDL2 under
+    # any other prefix does.  Look beside each include directory we were handed
+    # rather than assuming /usr, which is the case that is actually at risk.
     declare -a multiarch=()
     for f in ${extraCFlags[@]+"${extraCFlags[@]}"}; do
         [ "${f#-I}" = "$f" ] && continue
