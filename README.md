@@ -1,8 +1,8 @@
 # kerr — a spectral path tracer for a spinning black hole
 
 A Monte Carlo path tracer whose rays are null geodesics of the **Kerr** metric,
-rendering a relativistic **Novikov–Thorne** accretion disk. C++20, no
-dependencies, multithreaded.
+rendering a relativistic **Novikov–Thorne** accretion disk. C++20,
+multithreaded, no dependencies — the interactive viewer alone adds SDL2.
 
 Gravitational lensing, frame dragging, gravitational redshift, orbital Doppler
 beaming, the photon ring and the flattened Kerr shadow are not drawn as effects.
@@ -86,6 +86,9 @@ sudo apt install libsdl2-dev   # the viewer needs it; the batch renderer does no
 ./kerr
 ./kerrview
 ```
+
+`kerr-orbit.avi` is stored in Git LFS, so `git-lfs` has to be installed before
+cloning; without it `git status` itself fails, not merely that one file.
 
 Read every `.\kerr.exe` below as `./kerr`. Nothing else differs: there is no
 platform-specific code in either front end, and the self-test passes identically
@@ -1055,6 +1058,8 @@ A full-orbit looping video, which is what the animation path is for:
 ## Layout
 
 ```
+build.ps1         Windows build: fetches Zig and SDL2 into .toolchain
+build.sh          Linux build: system clang++/g++, else a fetched Zig
 src/core.hpp      vectors, metric container, PCG32, sampling
 src/kerr.hpp      Kerr metric, geodesic RHS, Dormand-Prince, tetrads
 src/scene.hpp     Novikov-Thorne disk, optical-depth edge, star field
