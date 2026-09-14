@@ -1,3 +1,11 @@
+# Normalise text files to LF in the repository and on checkout.  Without this
+# the tree reads as modified from Linux, because Git for Windows defaults to
+# core.autocrlf=true and writes CRLF into a working copy whose blobs are LF.
+#
+# This rule must stay ABOVE the *.avi line: for a given attribute the last
+# matching pattern wins, and the video has to keep its -text to stay binary.
+* text=auto eol=lf
+
 *.avi filter=lfs diff=lfs merge=lfs -text
 # build.sh must reach the disk with LF endings whatever the checkout does:
 # Git for Windows defaults to core.autocrlf=true, and a shebang followed by
