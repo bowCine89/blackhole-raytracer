@@ -135,32 +135,42 @@ g             3D ray view (see below)                q       quit
 ### Seeing the rays
 
 The rendered image is an integral; `g` shows you the integrand. It freezes the
-camera, traces a sparse grid of the rays that camera is casting, and draws them
-as a wireframe you can orbit around. The trajectories stay pinned to the
-viewpoint they were launched from, so dragging moves your eye and not theirs —
-which is the only arrangement in which you can walk around a bundle of geodesics
-and see its shape.
+camera, traces a grid of the rays that camera is casting, and hangs the frame
+they produced in space at the camera's own image plane. You enter at exactly the
+viewpoint you pressed the key from, so the first thing you see is the traced
+image filling the window as it did a moment ago, now with its own rays drawn
+radiating through it. Then you drag, and the picture you were looking at turns
+out to be one face of a three-dimensional object.
 
-![Rays cast by the camera, bending around the hole](out/rays.png)
+![The traced frame hanging in the bundle of rays that produced it](out/rays.png)
 
-Colour is the outcome, which is the same classification that decides what the
-final image looks like: **blue** escapes to the star field, **amber** lands on
-the disk, **red** falls through the horizon. The white cross is the camera the
-rays were launched from. What is worth looking for is the rays that leave
-heading nowhere near the hole and are turned onto it anyway, and the amber ones
-that reach the disk from *underneath* after passing the far side — those are the
-lensed images the front view cannot explain.
+The trajectories stay pinned to the viewpoint that launched them, so dragging
+moves your eye and not theirs — which is the only arrangement in which you can
+walk around a bundle of geodesics and see its shape. Colour is the outcome, the
+same classification that decides what the final image looks like: **blue**
+escapes to the star field, **amber** lands on the disk, **red** falls through
+the horizon. The white cross is the camera, and the faint quad in front of it is
+the image plane, drawn at the true frustum angle.
+
+What is worth looking for is the rays that leave heading nowhere near the hole
+and are turned onto it anyway, and the amber ones that reach the disk from
+*underneath* after passing the far side — those are the lensed images the front
+view cannot explain.
 
 ```
-g                    enter and leave the ray view
+g                    enter, and fly back out
 left drag / wheel    orbit and dolly the inspection camera
-[ / ]                fewer / more rays
+[ / ]                fewer / more rays        (273 to begin with)
 s                    save the diagram to kerrview-rays.png
-ESC                  back to the traced view
+ESC                  cut straight back to the traced view
 ```
 
-`--autorays` opens it at startup. Leaving restores the camera you entered with,
-so the view costs nothing.
+Pressing `g` again does not cut. It flies the inspection camera back to the
+viewpoint the rays were launched from over about a second, and only hands over
+to the traced image once it arrives — and since that image is rendered from
+exactly that pose, and is already hanging there at the image plane filling the
+frame, the handover has nothing to give away. `--autorays` opens the view at
+startup.
 
 Two honest caveats. The rays are integrated to the same tolerance as the render,
 but escaping ones are cut off a little beyond the camera radius so the picture
@@ -171,11 +181,6 @@ oblate-spheroidal embedding $(\sqrt{r^2+a^2}\sin\theta\cos\phi,\;
 drawing convention, not a geometry, so what you are seeing is where the ray goes
 in these coordinates, not a picture of curved space. The curvature you can see
 is real; the flat space it appears to curve through is not.
-
-The disk does not turn *live*, and cannot: a rotating disk changes faster than
-the tracer converges, so an animating viewer would be pinned at one sample per
-pixel forever and never settle. Progressive refinement and animation are
-directly at odds.
 
 ### Bake and loop
 

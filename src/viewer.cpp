@@ -478,9 +478,30 @@ struct RayVis {
     CameraParams source;          // the viewpoint the rays were launched from
     Real   sourceA = 0;
     Real   rHorizon = 2, rIn = 6, rOut = 18;
-    int    gridX = 13, gridY = 7;
+    int    gridX = 21, gridY = 13;
     bool   captured = false;
+
+    // The traced frame, frozen on entry and hung in space where the camera's
+    // image plane actually is.  Seeing the picture the rays produced, sitting
+    // in the bundle that produced it, is the whole reason this is worth having.
+    std::vector<uint8_t> imgPixels;      // winW*winH*3 at the moment of capture
+    int          imgW = 0, imgH = 0;
+    SDL_Texture* imgTex = nullptr;
+    Vec3 camPos{}, camFwd{}, camRight{}, camUp{};
+    Real planeDist = 0, planeHalfW = 0, planeHalfH = 0;
 };
+
+// Cartesian images of the Boyer-Lindquist basis directions, by finite
+// difference on the embedding.  Cheap, and it keeps the plane's orientation
+// tied to the same basis the camera is built from rather than to a guess.
+static void cartBasis(Real r, Real th, Real ph, Real a,
+                      Vec3& er, Vec3& eth, Vec3& eph) {
+    const Real h = 1e-4;
+    Vec3 p = blToCart(r, th, ph, a);
+    er  = normalize(blToCart(r + h, th, ph, a) - p);
+    eth = normalize(blToCart(r, th + h, ph, a) - p);
+    eph = normalize(blToCart(r, th, ph + h, a) - p);
+}
 
 // An ordinary pinhole camera in the embedding space.  Nothing here is a
 // geodesic: we are looking *at* the spacetime from outside it, so straight
@@ -548,9 +569,24 @@ static void captureRays(RayVis& rv, const Scene& sc, const CameraParams& cam) {
     rv.rHorizon = sc.kerr.horizon();
     rv.rIn      = sc.disk.rIn;
     rv.rOut     = sc.disk.rOut;
-    // Aim at a point between the hole and the launch site so both stay framed.
-    rv.target   = blToCart(cam.camR, cam.incDeg * PI / 180,
-                           cam.phiDeg * PI / 180, sc.kerr.a) * 0.42;
+    rv.target   = Vec3{0, 0, 0};    // orbit the hole; entry sits at the launch point
+
+    // The image plane, in the same frame the renderer's Camera uses: fwd is
+    // -e_r, up is -e_theta, right is +e_phi, then yaw and pitch on top.  Its
+    // half-extents follow tanHalf exactly, so the quad is the frustum the
+    // frame was actually rendered through and not an approximation of it.
+    Vec3 er, eth, eph;
+    cartBasis(cam.camR, cam.incDeg * PI / 180, cam.phiDeg * PI / 180, sc.kerr.a, er, eth, eph);
+    rv.camPos   = blToCart(cam.camR, cam.incDeg * PI / 180, cam.phiDeg * PI / 180, sc.kerr.a);
+    rv.camFwd   = -er;
+    rv.camUp    = -eth;
+    rv.camRight = eph;
+    Camera::rotate(rv.camUp,    cam.yawDeg   * PI / 180, rv.camFwd, rv.camRight);
+    Camera::rotate(rv.camRight, cam.pitchDeg * PI / 180, rv.camFwd, rv.camUp);
+    Real tanHalf   = std::tan(0.5 * cam.fovDeg * PI / 180);
+    rv.planeDist   = cam.camR * 0.42;
+    rv.planeHalfH  = rv.planeDist * tanHalf;
+    rv.planeHalfW  = rv.planeHalfH * cam.aspect;
 
     Camera camera(sc.kerr, cam);
     Propagator prop = sc.prop;
@@ -577,19 +613,33 @@ static void captureRays(RayVis& rv, const Scene& sc, const CameraParams& cam) {
     rv.captured = true;
 }
 
-// Where to stand when the ray view opens.  Staying exactly where the rays were
-// launched is faithful but useless: every trajectory leaves the eye, so the
-// first frame is a starburst and nothing about the geometry is visible.
-// Stepping off the launch axis and pulling back shows the bundle side-on, which
-// is the picture worth having; dragging from there does the rest.
-static CameraParams inspectionPose(const CameraParams& source) {
-    CameraParams v = source;
-    v.incDeg = clampf(source.incDeg > 90 ? source.incDeg - 40 : source.incDeg + 40, 8.0, 172.0);
-    v.phiDeg = source.phiDeg + 30;
-    v.camR   = source.camR * 1.5;
-    v.fovDeg = 55;
-    v.yawDeg = v.pitchDeg = 0;
-    return v;
+// Interpolate two inspection poses.  Azimuth takes the short way round, so a
+// return that crosses phi = 0 does not unwind the long way.
+static CameraParams lerpPose(const CameraParams& a, const CameraParams& b, Real u) {
+    CameraParams o = a;
+    Real dPhi = b.phiDeg - a.phiDeg;
+    while (dPhi >  180) dPhi -= 360;
+    while (dPhi < -180) dPhi += 360;
+    o.phiDeg   = a.phiDeg + dPhi * u;
+    o.incDeg   = a.incDeg + (b.incDeg - a.incDeg) * u;
+    o.fovDeg   = a.fovDeg + (b.fovDeg - a.fovDeg) * u;
+    o.yawDeg   = a.yawDeg + (b.yawDeg - a.yawDeg) * u;
+    o.pitchDeg = a.pitchDeg + (b.pitchDeg - a.pitchDeg) * u;
+    // Radius moves geometrically: a linear sweep from 300M to 40M spends most
+    // of its time far away and then lunges at the end.
+    o.camR = a.camR * std::pow(b.camR / std::max<Real>(a.camR, 1e-6), double(u));
+    return o;
+}
+
+static void rebuildRayTexture(SDL_Renderer* ren, RayVis& rv) {
+    if (rv.imgTex) { SDL_DestroyTexture(rv.imgTex); rv.imgTex = nullptr; }
+    if (rv.imgW <= 0 || rv.imgH <= 0 ||
+        rv.imgPixels.size() < size_t(rv.imgW) * size_t(rv.imgH) * 3) return;
+    rv.imgTex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24,
+                                  SDL_TEXTUREACCESS_STATIC, rv.imgW, rv.imgH);
+    if (!rv.imgTex) return;
+    SDL_UpdateTexture(rv.imgTex, nullptr, rv.imgPixels.data(), rv.imgW * 3);
+    SDL_SetTextureBlendMode(rv.imgTex, SDL_BLENDMODE_NONE);
 }
 
 static void drawRayVis(SDL_Renderer* ren, const RayVis& rv,
@@ -631,6 +681,61 @@ static void drawRayVis(SDL_Renderer* ren, const RayVis& rv,
         Real th = PI * l / 8;
         Real rr = std::sqrt(rh * rh + a * a) * std::sin(th);
         drawCircle(ren, vc, w, h, rr, rh * std::cos(th), 48);
+    }
+
+    // The traced frame, hung at the image plane.  Drawn before the rays so the
+    // bundle reads on top of it; with no depth buffer that is the better of the
+    // two wrong answers, and most of a ray's length lies beyond the plane anyway.
+    if (rv.imgTex && rv.imgW > 0 && rv.imgH > 0) {
+        // RenderGeometry maps affinely per triangle, so an oblique plane needs
+        // subdividing or the seams show.  This is dense enough that they do not.
+        const int NU = 40, NV = 26;
+        auto corner = [&](int i, int j) {
+            Real u = Real(i) / NU, v = Real(j) / NV;
+            return rv.camPos + rv.camFwd * rv.planeDist
+                 + rv.camRight * ((2 * u - 1) * rv.planeHalfW)
+                 + rv.camUp    * ((1 - 2 * v) * rv.planeHalfH);
+        };
+        auto toPix = [&](const Vec3& q, SDL_FPoint& out) {
+            Real sx, sy, z;
+            if (!vc.project(q, sx, sy, z)) return false;
+            out.x = float((sx + 1) * 0.5 * w);
+            out.y = float((1 - sy) * 0.5 * h);
+            return true;
+        };
+        std::vector<SDL_Vertex> verts;
+        std::vector<int> idx;
+        verts.reserve(size_t(NU + 1) * (NV + 1));
+        std::vector<char> ok(size_t(NU + 1) * (NV + 1), 0);
+        const SDL_Color tint{255, 255, 255, 255};
+        for (int j = 0; j <= NV; ++j)
+            for (int i = 0; i <= NU; ++i) {
+                SDL_Vertex v{};
+                v.color = tint;
+                v.tex_coord = { float(i) / NU, float(j) / NV };
+                ok[size_t(j) * (NU + 1) + i] = toPix(corner(i, j), v.position) ? 1 : 0;
+                verts.push_back(v);
+            }
+        auto at = [&](int i, int j) { return size_t(j) * (NU + 1) + i; };
+        for (int j = 0; j < NV; ++j)
+            for (int i = 0; i < NU; ++i) {
+                size_t a0 = at(i, j), b0 = at(i + 1, j), c0 = at(i, j + 1), d0 = at(i + 1, j + 1);
+                if (!(ok[a0] && ok[b0] && ok[c0] && ok[d0])) continue;   // straddles the eye
+                idx.push_back(int(a0)); idx.push_back(int(b0)); idx.push_back(int(d0));
+                idx.push_back(int(a0)); idx.push_back(int(d0)); idx.push_back(int(c0));
+            }
+        if (!idx.empty())
+            SDL_RenderGeometry(ren, rv.imgTex, verts.data(), int(verts.size()),
+                               idx.data(), int(idx.size()));
+        // A border, so the plane reads as an object rather than a smear.
+        SDL_SetRenderDrawColor(ren, 150, 150, 165, 255);
+        Vec3 c00 = corner(0, 0), c10 = corner(NU, 0), c11 = corner(NU, NV), c01 = corner(0, NV);
+        drawSeg(ren, vc, w, h, c00, c10); drawSeg(ren, vc, w, h, c10, c11);
+        drawSeg(ren, vc, w, h, c11, c01); drawSeg(ren, vc, w, h, c01, c00);
+        // And the four frustum edges back to the eye.
+        SDL_SetRenderDrawColor(ren, 70, 70, 86, 255);
+        drawSeg(ren, vc, w, h, rv.camPos, c00); drawSeg(ren, vc, w, h, rv.camPos, c10);
+        drawSeg(ren, vc, w, h, rv.camPos, c11); drawSeg(ren, vc, w, h, rv.camPos, c01);
     }
 
     // The rays, coloured by how each one ended.
@@ -886,6 +991,13 @@ int main(int argc, char** argv) {
 
     Mode   mode = Mode::Live;
     RayVis rayVis;
+    // Leaving flies the inspection camera back to the viewpoint the rays were
+    // launched from, and only then hands over to the traced image -- which is
+    // rendered from exactly that pose, so the cut lands on a matching frame.
+    bool              raysLeaving = false;
+    Clock::time_point raysLeaveAt{};
+    CameraParams      raysLeaveFrom{};
+    const double      raysLeaveSecs = 1.1;
     Bake bake;
     bake.targetSpp = bakeSpp;
     bake.videoPath = videoOut;
@@ -949,10 +1061,30 @@ int main(int argc, char** argv) {
         // frame of a sequence can be taken to full convergence: see
         // `kerr.exe --frames`.
 
+        if (mode == Mode::Rays && raysLeaving) {
+            double u = std::min(1.0, since(raysLeaveAt) / raysLeaveSecs);
+            double e = u * u * (3 - 2 * u);                  // smoothstep
+            camWanted = lerpPose(raysLeaveFrom, rayVis.source, Real(e));
+            if (u >= 1.0) {
+                camWanted   = rayVis.source;
+                mode        = Mode::Live;
+                raysLeaving = false;
+                camChanged  = true;
+                lastInput   = Clock::now();
+                std::printf("  rays: back to live\n");
+                std::fflush(stdout);
+            }
+        }
+
         // Scripted ray view, so it can be exercised without a hand on the mouse.
         if (autoRays && mode == Mode::Live && !rayVis.captured && since(startTime) > 0.4) {
-            reconfigure(S, [&] { captureRays(rayVis, sc, camWanted); });
-            camWanted = inspectionPose(rayVis.source);
+            reconfigure(S, [&] {
+                captureRays(rayVis, sc, camWanted);
+                rayVis.imgPixels = S.display;
+                rayVis.imgW = winW;
+                rayVis.imgH = winH;
+            });
+            rebuildRayTexture(ren, rayVis);
             mode = Mode::Rays;
             std::printf("  [auto] ray view: %zu trajectories\n", rayVis.lines.size());
             std::fflush(stdout);
@@ -1042,6 +1174,7 @@ int main(int argc, char** argv) {
                 // Rays mode orbits the inspection camera; baking and playback
                 // assume a fixed one.
                 if (mode != Mode::Live && mode != Mode::Rays) break;
+                if (mode == Mode::Rays && raysLeaving) break;
                 if (dragOrbit && (e.motion.xrel || e.motion.yrel)) {
                     // Negated to match the other two axes: screen-right is the
                     // direction of increasing phi, so orbiting with +xrel swings
@@ -1113,6 +1246,7 @@ int main(int argc, char** argv) {
                 case SDLK_ESCAPE:
                     if (mode == Mode::Rays) {
                         mode = Mode::Live;
+                        raysLeaving = false;
                         camWanted = rayVis.source;
                         camChanged = true;
                         std::printf("  rays: back to live\n");
@@ -1134,19 +1268,24 @@ int main(int argc, char** argv) {
                     if (mode == Mode::Live) {
                         // Capture with the workers parked: the scene is only
                         // safe to read while nothing is tracing it.
-                        reconfigure(S, [&] { captureRays(rayVis, sc, camWanted); });
-                        camWanted = inspectionPose(rayVis.source);
+                        reconfigure(S, [&] {
+                            captureRays(rayVis, sc, camWanted);
+                            rayVis.imgPixels = S.display;    // the frame these rays made
+                            rayVis.imgW = winW;
+                            rayVis.imgH = winH;
+                        });
+                        rebuildRayTexture(ren, rayVis);
                         mode = Mode::Rays;
                         std::printf("  rays: %zu trajectories from r = %.1f M, inc %.0f deg"
                                     "  (drag to orbit, [ / ] density, G or ESC to return)\n",
                                     rayVis.lines.size(), double(camWanted.camR),
                                     double(camWanted.incDeg));
                         std::fflush(stdout);
-                    } else if (mode == Mode::Rays) {
-                        mode = Mode::Live;
-                        camWanted = rayVis.source;   // leave the view as we found it
-                        camChanged = true;
-                        std::printf("  rays: back to live\n");
+                    } else if (mode == Mode::Rays && !raysLeaving) {
+                        raysLeaving   = true;
+                        raysLeaveAt   = Clock::now();
+                        raysLeaveFrom = camWanted;
+                        std::printf("  rays: flying back\n");
                         std::fflush(stdout);
                     }
                     break;
@@ -1479,6 +1618,7 @@ int main(int argc, char** argv) {
     S.cv.notify_all();
     for (auto& t : pool) t.join();
 
+    if (rayVis.imgTex) SDL_DestroyTexture(rayVis.imgTex);
     SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
