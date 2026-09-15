@@ -838,7 +838,10 @@ p_r = n_{\hat r}\sqrt{\Sigma/\Delta}, \quad
 p_\theta = n_{\hat\theta}\sqrt{\Sigma}.
 $$
 
-Rays are built in this tetrad, so `--fov` is a genuine local angle.
+Rays are built in this tetrad, so `--fov` is a genuine local angle. It is the
+**vertical** one: the horizontal follows from the aspect ratio and is wider,
+$2\arctan(\tan(\mathrm{fov}/2)\cdot w/h)$, so the default 40° spans 65.8°
+across a 16:9 frame.
 
 ### 9. Background — procedural star field
 

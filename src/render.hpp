@@ -272,7 +272,7 @@ struct CameraParams {
     Real camR      = 40.0;    // Boyer-Lindquist radius, in M
     Real incDeg    = 80.0;    // inclination from the spin axis; 90 = edge-on
     Real phiDeg    = 0.0;     // azimuth around the spin axis
-    Real fovDeg    = 40.0;    // horizontal field of view
+    Real fovDeg    = 40.0;    // *vertical* field of view; see ray() below
     Real yawDeg    = 0.0;     // aim offset, left/right
     Real pitchDeg  = 0.0;     // aim offset, up/down
     Real aspect    = 16.0 / 9.0;
@@ -308,6 +308,9 @@ struct Camera {
         b = normalize(rot(b));
     }
 
+    // sx and sy both run -1 to 1, and only sx carries the aspect ratio, so it is
+    // the *vertical* half-angle that equals fovDeg/2.  The horizontal one is
+    // atan(tanHalf * aspect), which is wider: 40 degrees at 16:9 is 65.8 across.
     Geodesic ray(Real sx, Real sy) const {
         Vec3 d = normalize(fwd + right * (sx * tanHalf * aspect) + up * (sy * tanHalf));
         return zamo.emit(r, th, ph, d);

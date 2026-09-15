@@ -511,7 +511,7 @@ static void usage() {
 "  --dist R                    camera radius in M              (40)\n"
 "  --inc DEG                   inclination, 90 = edge-on       (80)\n"
 "  --cam-phi DEG               camera azimuth                  (0)\n"
-"  --fov DEG                   horizontal field of view        (40)\n"
+"  --fov DEG                   vertical field of view          (40)\n"
 "  --yaw DEG --pitch DEG       aim offset from the hole        (0 0)\n"
 "\n"
 "Accretion disk\n"
