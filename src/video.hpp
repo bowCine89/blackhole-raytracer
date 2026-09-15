@@ -14,9 +14,23 @@
 #pragma once
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#  define KERR_POPEN   _popen
+#  define KERR_PCLOSE  _pclose
+#  define KERR_PIPEW   "wb"
+#  define KERR_NULLDEV "NUL"
+#else
+#  define KERR_POPEN   popen
+#  define KERR_PCLOSE  pclose
+#  define KERR_PIPEW   "w"
+#  define KERR_NULLDEV "/dev/null"
+#  include <csignal>
+#endif
 
 namespace vid {
 
@@ -150,6 +164,158 @@ private:
     uint32_t moviListPos_ = 0, moviDataPos_ = 0;
     std::vector<uint32_t> index_;
     std::vector<uint8_t> row_;
+};
+
+// ---------------------------------------------------------------------------
+// H.265, by piping raw frames to ffmpeg
+// ---------------------------------------------------------------------------
+//
+// An HEVC encoder is not something that belongs in a header, and linking libx265
+// would end the project's habit of building with nothing installed.  So ffmpeg
+// is a *runtime* dependency and an optional one: frames go down a pipe as raw
+// RGB and it does the encoding.  The build is unchanged, and a machine without
+// ffmpeg still renders everything -- it just cannot compress it.
+//
+// The defaults are chosen for this material rather than for video in general.
+// The disk is a smooth gradient over a black field, which is exactly what shows
+// 8-bit banding, so the pipe is 10-bit by default even though the source is
+// 8-bit RGB: the extra depth costs almost nothing and gives the encoder room to
+// dither rather than contour.  crf 18 at preset slow is visually lossless on
+// this content; crf 0 is mathematically lossless if that is what you want.
+class H265Writer {
+public:
+    int         crf    = 18;
+    std::string preset = "slow";
+    bool        tenBit = true;
+
+    // ffmpeg is looked up on PATH unless KERR_FFMPEG names a binary.
+    static std::string exe() {
+        const char* e = std::getenv("KERR_FFMPEG");
+        return (e && *e) ? std::string(e) : std::string("ffmpeg");
+    }
+
+    static bool available() {
+        std::string cmd = quote(exe()) + " -hide_banner -version > " KERR_NULLDEV " 2>&1";
+        return std::system(cmd.c_str()) == 0;
+    }
+
+    bool open(const std::string& path, int width, int height, double fps) {
+        w_ = width; h_ = height; fps_ = fps > 0 ? fps : 24.0;
+        path_ = path;
+        frameBytes_ = size_t(w_) * h_ * 3;
+
+        char buf[1024];
+        std::snprintf(buf, sizeof buf,
+            "%s -hide_banner -loglevel error -y -f rawvideo -pix_fmt rgb24 "
+            "-s %dx%d -r %.6f -i - -an -c:v libx265 -preset %s -crf %d "
+            "-pix_fmt %s -x265-params log-level=error -tag:v hvc1 %s",
+            quote(exe()).c_str(), w_, h_, fps_, preset.c_str(), crf,
+            tenBit ? "yuv420p10le" : "yuv420p", quote(path_).c_str());
+
+#if !defined(_WIN32)
+        // If the encoder dies mid-sequence the next write hits a broken pipe,
+        // and the default disposition for SIGPIPE would take the renderer down
+        // with it -- silently, halfway through a job that can run for hours.
+        // Ignoring it turns that into a short write we can report instead.
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
+        f_ = KERR_POPEN(buf, KERR_PIPEW);
+        return f_ != nullptr;
+    }
+
+    bool addFrame(const uint8_t* rgb) {
+        if (!f_) return false;
+        if (std::fwrite(rgb, 1, frameBytes_, f_) != frameBytes_) {
+            broken_ = true;          // encoder went away; close() will report it
+            return false;
+        }
+        ++frames_;
+        return true;
+    }
+
+    bool close() {
+        if (!f_) return false;
+        int rc = KERR_PCLOSE(f_);
+        f_ = nullptr;
+        // Size comes off the finished file: the whole point is that we do not
+        // know it in advance.
+        if (FILE* g = std::fopen(path_.c_str(), "rb")) {
+            std::fseek(g, 0, SEEK_END);
+            long n = std::ftell(g);
+            std::fclose(g);
+            if (n > 0) bytes_ = size_t(n);
+        }
+        return rc == 0 && !broken_;
+    }
+
+    int    frames() const { return frames_; }
+    size_t bytes()  const { return bytes_; }
+
+private:
+    // Shell-quote a path.  Single quotes everywhere but Windows, which does not
+    // understand them.
+    static std::string quote(const std::string& s) {
+#if defined(_WIN32)
+        return "\"" + s + "\"";
+#else
+        std::string o = "'";
+        for (char c : s) { if (c == '\'') o += "'\\''"; else o += c; }
+        return o + "'";
+#endif
+    }
+
+    FILE* f_ = nullptr;
+    std::string path_;
+    int w_ = 0, h_ = 0, frames_ = 0;
+    double fps_ = 24.0;
+    size_t frameBytes_ = 0, bytes_ = 0;
+    bool   broken_ = false;
+};
+
+// ---------------------------------------------------------------------------
+// One handle over both, chosen by the output extension
+// ---------------------------------------------------------------------------
+// .avi keeps the built-in uncompressed writer, so nothing that worked before
+// behaves differently.  Anything ffmpeg can mux -- .mp4, .mkv, .mov, .hevc --
+// goes through H.265.
+class VideoWriter {
+public:
+    int crf = 18;
+
+    static bool wantsH265(const std::string& path) {
+        size_t dot = path.find_last_of('.');
+        if (dot == std::string::npos) return false;
+        std::string e = path.substr(dot + 1);
+        for (char& c : e) c = char(std::tolower((unsigned char)c));
+        return e == "mp4" || e == "mkv" || e == "mov" || e == "hevc" || e == "265";
+    }
+
+    // Returns false with a printed reason; the caller decides what to do.
+    bool open(const std::string& path, int w, int h, double fps) {
+        h265_ = wantsH265(path);
+        if (!h265_) return avi_.open(path, w, h, fps);
+        if (!H265Writer::available()) {
+            std::fprintf(stderr,
+                "  %s needs ffmpeg with libx265 on PATH, and it was not found.\n"
+                "    Debian/Ubuntu:  sudo apt install ffmpeg\n"
+                "    or set KERR_FFMPEG to a binary, or write .avi instead.\n",
+                path.c_str());
+            return false;
+        }
+        hev_.crf = crf;
+        return hev_.open(path, w, h, fps);
+    }
+    bool addFrame(const uint8_t* rgb) { return h265_ ? hev_.addFrame(rgb) : avi_.addFrame(rgb); }
+    bool close()                      { return h265_ ? hev_.close()       : avi_.close(); }
+    int    frames() const             { return h265_ ? hev_.frames()      : avi_.frames(); }
+    size_t bytes()  const             { return h265_ ? hev_.bytes()       : avi_.bytes(); }
+    bool   compressed() const         { return h265_; }
+    const char* codec() const         { return h265_ ? "H.265" : "uncompressed"; }
+
+private:
+    bool h265_ = false;
+    AviWriter  avi_;
+    H265Writer hev_;
 };
 
 } // namespace vid

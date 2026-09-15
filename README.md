@@ -222,6 +222,8 @@ accumulated so far. `s` during playback writes the whole sequence as
 default, or wherever `--video` points — so it can be played back outside the
 viewer at exactly the quality it was rendered at. It is written at every point a
 bake ends: the frame limit, `SPACE`, or a scripted run. `--no-video` skips it.
+Point `--video` at an `.mp4` instead and it is encoded as H.265 — worth doing,
+since the default 180-frame cap is half a gigabyte uncompressed.
 
 The bake targets **one full ISCO orbit** by default (`--bake-orbits`,
 `--bake-frames`), and the sequence closes exactly on itself by the cross-fade
@@ -655,6 +657,47 @@ the playback rate stamped into the header, and `--no-png` keeps only the video.
 
 [`kerr-orbit.avi`](kerr-orbit.avi) in the repository root is exactly this
 command's output, kept in Git LFS.
+
+**H.265.** Give `--video` an `.mp4`, `.mkv`, `.mov` or `.hevc` name instead and
+the frames are piped to ffmpeg and encoded as HEVC as they render:
+
+```sh
+./kerr --frames 96 --orbits 1 --loop --video kerr-orbit.mp4 --no-png
+```
+
+The saving is not marginal. That command, at 96 frames of 1280×720, is **265 MB**
+as an uncompressed AVI and **0.30 MB** as H.265 — **888× smaller**, for four
+seconds of playback that still loops seamlessly. (Measured at 32 spp; a cleaner
+render compresses better still, since most of what is left to encode is sampling
+noise.)
+
+`--crf` sets the quality. The default 18 is visually lossless on this material:
+against the uncompressed frames of the same sequence it holds **49.4 dB PSNR**
+at 480×270. `--crf 0` is mathematically lossless, and higher numbers trade
+quality for size:
+
+| `--crf` | 0 | 12 | 18 (default) | 28 |
+|---|--:|--:|--:|--:|
+| 12 frames at 480×270 | 182 KB | 66 KB | 37 KB | 15 KB |
+
+The pipe carries 10-bit `yuv420p10le` even though the frames leave the tone
+mapper as 8-bit RGB, which is not a mistake. The disk is a smooth gradient over
+a black field, which is exactly the content that shows 8-bit banding; the extra
+depth costs almost nothing and gives the encoder room to dither rather than
+contour.
+
+This is the one place the project asks for something it does not ship. An HEVC
+encoder does not belong in a header, and linking libx265 would end the habit of
+building with nothing installed — so ffmpeg is a **runtime** dependency and an
+optional one. The build never sees it, `.avi` never needs it, and a machine
+without it still renders every frame. When it is missing the writer says so
+before the first frame rather than after the last:
+
+```sh
+sudo apt install ffmpeg        # Debian / Ubuntu
+```
+
+`KERR_FFMPEG` names a binary if it is not on `PATH`.
 
 #### Making the loop close
 
@@ -1124,7 +1167,7 @@ src/kerr.hpp      Kerr metric, geodesic RHS, Dormand-Prince, tetrads
 src/scene.hpp     Novikov-Thorne disk, optical-depth edge, star field
 src/spectrum.hpp  Planck, CIE 1931, sRGB, ACES
 src/image.hpp     PNG / PPM / PFM writers (no libraries)
-src/video.hpp     streaming uncompressed AVI writer (no libraries)
+src/video.hpp     streaming AVI writer, and H.265 through ffmpeg
 src/simd.hpp      8-wide vector types, vectorised sincos and fifth root
 src/packet.hpp    SoA Dormand-Prince and packet path tracing
 src/render.hpp    scalar propagation and path tracing, camera -- the reference

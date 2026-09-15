@@ -778,6 +778,7 @@ struct Bake {
     Real   orbitPeriod = 24.0;   // ISCO orbital period, the natural loop unit
     Real   loopSpan    = 0;      // planned sequence length; the loop closes on it
     std::string videoPath;       // empty disables the video
+    int         crf = 18;        // H.265 quality when videoPath is .mp4/.mkv
 
     size_t bytes() const { return frames.empty() ? 0 : frames.size() * frames[0].size(); }
     Real   span()  const { return frames.empty() ? 0 : Real(frames.size()) * step; }
@@ -789,16 +790,23 @@ struct Bake {
 // case for throwing quality away on the way to disk.
 static bool writeBakeVideo(const Bake& bake, int w, int h) {
     if (bake.videoPath.empty() || bake.frames.size() < 2) return false;
-    vid::AviWriter avi;
-    if (!avi.open(bake.videoPath, w, h, bake.fps)) {
+    vid::VideoWriter vw;
+    vw.crf = bake.crf;
+    if (!vw.open(bake.videoPath, w, h, bake.fps)) {
         std::printf("  could not open %s for writing\n", bake.videoPath.c_str());
         return false;
     }
-    for (const auto& f : bake.frames) avi.addFrame(f.data());
-    avi.close();
-    std::printf("  wrote %s   %d frames, %dx%d, %.0f fps, %.0f MB   (%.2f ISCO orbits)\n",
-                bake.videoPath.c_str(), avi.frames(), w, h, bake.fps,
-                avi.bytes() / 1.0e6, double(bake.orbits()));
+    for (const auto& f : bake.frames) vw.addFrame(f.data());
+    if (!vw.close())
+        std::printf("  the encoder reported a failure; %s may be truncated\n",
+                    bake.videoPath.c_str());
+    double mb = vw.bytes() / 1.0e6;
+    char size[64];
+    if (mb >= 1.0) std::snprintf(size, sizeof size, "%.1f MB", mb);
+    else           std::snprintf(size, sizeof size, "%.0f KB", vw.bytes() / 1024.0);
+    std::printf("  wrote %s   %d frames, %dx%d, %.0f fps, %s (%s)   (%.2f ISCO orbits)\n",
+                bake.videoPath.c_str(), vw.frames(), w, h, bake.fps,
+                size, vw.codec(), double(bake.orbits()));
     std::fflush(stdout);
     return true;
 }
@@ -843,7 +851,8 @@ static void printControls() {
 "converge.  SPACE bakes a sequence instead -- the camera holds still, each\n"
 "frame is taken to --bake-spp samples before the clock advances -- and loops\n"
 "it back when you press SPACE again.  The window title always says what SPACE\n"
-"will do next.  The finished sequence is written as an uncompressed .avi.\n"
+"will do next.  The finished sequence is written as an uncompressed .avi;\n"
+"--video out.mp4 encodes H.265 instead, which is far smaller.\n"
 "\n"
 "The bake covers one ISCO orbit and closes exactly on itself; --no-loop keeps\n"
 "the untouched pattern instead, which leaves a visible jump at the wrap.\n\n");
@@ -862,7 +871,8 @@ int main(int argc, char** argv) {
     Real  bakeOrbits = 1.0;  // bake exactly this many ISCO orbits, then stop
     bool  bakeLoop   = true;  // --no-loop renders the true pattern with a visible seam
     int   bakeFrames = 96;   // frames per orbit
-    std::string videoOut = "kerrbake.avi";
+    std::string videoOut = "kerrbake.avi";   // .mp4 or .mkv here encodes H.265
+    int    bakeCrf = 18;
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     bool   autoRays  = false;   // scripted: open the ray view straight away
@@ -900,6 +910,7 @@ int main(int argc, char** argv) {
         else if (a == "--bake-frames") bakeFrames = nextI();
         else if (a == "--video")      videoOut = argv[++i];
         else if (a == "--no-video")   videoOut.clear();
+        else if (a == "--crf")        bakeCrf = nextI();
         else if (a == "--autobake")   autoBake = nextI();
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
@@ -915,7 +926,8 @@ int main(int argc, char** argv) {
 "  --rin R --rout R --tpeak K --albedo A --edge W --turbulence F\n"
 "  --bounces N --sky-gain F --nostars\n"
 "  --exposure F --fps F --threads N --rtol F\n"
-"  --autorays             open the 3D ray view at startup\n");
+"  --autorays             open the 3D ray view at startup\n"
+"  --video F --no-video --crf N    bake output; .mp4/.mkv encode H.265\n");
             printControls();
             return 0;
         }
@@ -1001,6 +1013,7 @@ int main(int argc, char** argv) {
     Bake bake;
     bake.targetSpp = bakeSpp;
     bake.videoPath = videoOut;
+    bake.crf       = bakeCrf;
     bake.orbitPeriod = TWO_PI / sc.disk.orbitOmega(sc.kerr.isco(true));
     {
         // Default to exactly one ISCO orbit, and tell the disk that is the loop

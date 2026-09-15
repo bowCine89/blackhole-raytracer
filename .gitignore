@@ -8,6 +8,8 @@
 *.pfm
 *.obj
 *.o
+# lld writes these beside the target when it cannot replace a running binary
+*.tmp[0-9a-f]*
 kerrview-*.png
 *.avi
 !kerr-orbit.avi

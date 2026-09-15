@@ -82,6 +82,7 @@ struct Config {
     bool  loop = false;              // make the sequence close exactly on itself
     std::string video;               // also stream the sequence to this .avi
     double fps = 24.0;               // playback rate written into the container
+    int   crf = 18;                  // H.265 quality; lower is better, 0 lossless
     bool  writePng = true;           // --no-png keeps only the video
 };
 
@@ -541,8 +542,10 @@ static void usage() {
 "  --orbits F                  ISCO orbits the sequence spans  (1)\n"
 "  --tstep T                   M between frames, overrides --orbits\n"
 "  --loop                      close the sequence exactly on itself\n"
-"  --video FILE                also write an uncompressed .avi\n"
+"  --video FILE                also write a video; .avi is uncompressed,\n"
+"                              .mp4/.mkv/.mov encode H.265 via ffmpeg\n"
 "  --fps F                     playback rate for --video       (24)\n"
+"  --crf N                     H.265 quality, 0 lossless       (18)\n"
 "  --no-png                    with --video, skip the frame PNGs\n"
 "\n"
 "Accuracy\n"
@@ -615,6 +618,7 @@ int main(int argc, char** argv) {
         else if (s == "--loop")        c.loop = true;
         else if (s == "--video")       c.video = argv[++i];
         else if (s == "--fps")         c.fps = needF(i);
+        else if (s == "--crf")         c.crf = needI(i);
         else if (s == "--no-png")      c.writePng = false;
         else if (s == "--help" || s == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", s.c_str()); usage(); return 2; }
@@ -716,17 +720,33 @@ int main(int argc, char** argv) {
     // Stream the sequence into an uncompressed AVI as it renders, so the loop
     // is playable without a post-processing step and nothing is ever held in
     // memory beyond the frame being written.
-    vid::AviWriter avi;
+    vid::VideoWriter vout;
+    vout.crf = c.crf;
     bool videoOpen = false;
     if (!c.video.empty() && c.frames > 1) {
-        videoOpen = avi.open(c.video, c.width, c.height, c.fps);
+        videoOpen = vout.open(c.video, c.width, c.height, c.fps);
         if (!videoOpen)
             std::fprintf(stderr, "cannot open %s for writing; continuing without video\n",
                          c.video.c_str());
-        else if (!c.quiet)
-            std::printf("  video             %s   %dx%d @ %.0f fps   %.0f MB when full\n",
-                        c.video.c_str(), c.width, c.height, c.fps,
-                        double(size_t(((c.width * 3 + 3) / 4) * 4) * c.height * c.frames) / 1.0e6);
+        else if (!c.quiet) {
+            if (vout.compressed())
+                std::printf("  video             %s   %dx%d @ %.0f fps   H.265 crf %d, 10-bit\n",
+                            c.video.c_str(), c.width, c.height, c.fps, c.crf);
+            else
+                std::printf("  video             %s   %dx%d @ %.0f fps   %.0f MB when full\n",
+                            c.video.c_str(), c.width, c.height, c.fps,
+                            double(size_t(((c.width * 3 + 3) / 4) * 4) * c.height * c.frames) / 1.0e6);
+        }
+    }
+
+    // --no-png with no usable container is a render to nowhere.  It was already
+    // possible to ask for exactly that -- and then be told, frame by frame, that
+    // files were being written -- whenever the video failed to open.
+    if (!c.writePng && !videoOpen) {
+        std::fprintf(stderr, "nothing would be written: --no-png is set and %s\n",
+                     c.video.empty() ? "no --video was given"
+                                     : "the video could not be opened");
+        return 1;
     }
 
     const Real tStart = c.tObs;
@@ -927,7 +947,7 @@ int main(int argc, char** argv) {
         out8[i * 3 + 2] = uint8_t(clampf(spec::srgbEncode(b) * 255.0 + 0.5, 0, 255));
     }
 
-    if (videoOpen) avi.addFrame(out8.data());
+    if (videoOpen) vout.addFrame(out8.data());
 
     if (c.writePng && !img::writePng(outPath, W, H, out8)) {
         std::fprintf(stderr, "failed to write %s\n", outPath.c_str());
@@ -951,13 +971,25 @@ int main(int argc, char** argv) {
     }   // end frame loop
 
     if (videoOpen) {
-        avi.close();
-        if (!c.quiet)
-            std::printf("\n  video             %s   %d frames, %dx%d, %.0f fps, %.0f MB\n"
+        bool ok = vout.close();
+        if (!ok)
+            std::fprintf(stderr, "  the encoder reported a failure; %s may be truncated\n",
+                         c.video.c_str());
+        if (!c.quiet) {
+            double raw = double(size_t(c.width) * c.height * 3 * vout.frames()) / 1.0e6;
+            double mb  = vout.bytes() / 1.0e6;
+            char size[64];
+            if (mb >= 1.0) std::snprintf(size, sizeof size, "%.1f MB", mb);
+            else           std::snprintf(size, sizeof size, "%.0f KB", vout.bytes() / 1024.0);
+            std::printf("\n  video             %s   %d frames, %dx%d, %.0f fps, %s (%s)\n"
                         "                    %.2f s of playback, spanning %.2f ISCO orbits\n",
-                        c.video.c_str(), avi.frames(), c.width, c.height, c.fps,
-                        avi.bytes() / 1.0e6, avi.frames() / c.fps,
-                        double(seqSpan / periodIsco));
+                        c.video.c_str(), vout.frames(), c.width, c.height, c.fps,
+                        size, vout.codec(),
+                        vout.frames() / c.fps, double(seqSpan / periodIsco));
+            if (vout.compressed() && vout.bytes() > 0)
+                std::printf("                    %.0fx smaller than the raw frames (%.0f MB)\n",
+                            raw / (vout.bytes() / 1.0e6), raw);
+        }
     }
     return 0;
 }
