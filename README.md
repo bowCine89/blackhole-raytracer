@@ -71,7 +71,7 @@ Everything above is physical except two clearly-marked knobs: `--turbulence`
 .\build.ps1              # fetches Zig + SDL2 into .toolchain on first run
 .\kerr.exe --check       # validate the geodesic engine against closed-form Kerr
 .\kerr.exe --preview     # 480x270, a couple of seconds
-.\kerr.exe               # 1280x720, 128 spp
+.\kerr.exe               # 1280x720, adaptive sampling
 .\kerrview.exe           # interactive viewer
 ```
 
@@ -1089,42 +1089,55 @@ the noise floor** measured between two seeds of the same build (3.3% against
 
 ### Spending samples where they are needed
 
-`--spp` gives every pixel the same budget, which is the wrong shape for this
-image: most of the frame is empty sky that is converged after a handful of
+A fixed `--spp` gives every pixel the same budget, which is the wrong shape for
+this image: most of the frame is empty sky, converged after a handful of
 samples, while the caustics around the photon ring are still moving at five
-hundred. `--noise` replaces the fixed count with a target, and each pixel stops
-when it reaches it:
+hundred. So the renderer does not use one. Each pixel samples until its own
+estimate is quiet enough and then stops:
 
 ```sh
-./kerr --noise 1 --spp 512
+./kerr                      # adaptive, the default
+./kerr --noise 0.5          # quieter, slower
+./kerr --spp 128            # a fixed count, the old behaviour
 ```
 
 The target is in **output LSB**, not in samples or in radiance. Each pixel
 tracks the variance of its own luminance estimates, and the standard error of
 the mean is pushed through the same ACES and sRGB curves the image will get, so
-`--noise 1` reads as *"stop once sampling noise moves this pixel by less than
-one step in 255"* — a statement about what will be visible rather than about the
-integrator. `--spp` becomes the ceiling and `--min-spp` the floor, since a
-variance built from four samples is not worth believing.
+the default `--noise 1` reads as *"stop once sampling noise moves this pixel by
+less than one step in 255"*. That is a statement about what will be visible
+rather than about the integrator, and one LSB is the natural place to put it:
+below the quantisation step of the file being written, noise has nowhere left to
+show. `--min-spp` is the floor, since a variance built from four samples is not
+worth believing, and `--max-spp` the ceiling.
 
-Measured at 480×270 against a 4096-spp reference:
+Measured at 640×360 against a 4096-spp reference, against the fixed 128 spp that
+used to be the default:
 
-| | mean spp | rms | p99 | p99.9 |
+| | time | rms | p99 | p99.9 |
 |---|--:|--:|--:|--:|
-| `--noise 1 --spp 512` | 53.5 | **0.71** | 2 | 6 |
-| flat `--spp 54`, the same cost | 54 | 1.63 | 6 | 20 |
+| `--spp 128`, the old default | 5.54 s | 1.09 | 4 | 13 |
+| `--noise 1`, the new one | **2.81 s** | **0.62** | 2 | 5 |
+| `--noise 0.5` | 5.11 s | 0.54 | 2 | 4 |
+| `--noise 2` | 0.81 s | 0.79 | 3 | 6 |
 
-Same work, **2.3× less noise**, and three times better in the tail — because
-the samples went to the 3% of pixels that needed them instead of being spread
-evenly over a frame that is mostly sky.
+Half the time and 43% less error, because the samples went to the few per cent
+of pixels that needed them instead of being spread evenly over a frame that is
+mostly sky. At 1280×720 the full default render is 3.9 s where it used to be
+10.8 s, and settles at 41 samples per pixel on average with 0.7% of pixels
+reaching the cap.
+
+Note that every row in that table beats the old default on both axes — even
+`--noise 2`, which is seven times faster. Fixed sample counts were leaving a
+great deal on the table.
 
 Two things worth knowing. The criterion bounds the *estimated standard error*,
-so it is a one-sigma statement: a small fraction of pixels will land two or
-three times over the target, which is what the p99 column shows. And the stop
-needs the tone curve, which needs an image, so a short fixed pass runs first to
-give the exposure something to meter — its samples are kept and counted, not
-thrown away. Without `--noise` none of this engages and the renderer is
-bit-for-bit what it was.
+so it is a one-sigma statement: a small fraction of pixels land two or three
+times over the target, which is what the p99 column shows. And the stop needs
+the tone curve, which needs an image, so a short fixed pass runs first to give
+the exposure something to meter — its samples are kept and counted, not thrown
+away. Naming `--spp` explicitly turns all of this off and renders exactly that
+many samples, bit for bit as it always did.
 
 ### Where the remaining headroom is
 
@@ -1139,8 +1152,8 @@ compaction is paid for.
 ## Options
 
 ```
-Image     --width --height --spp --noise --min-spp --bounces --threads
-          --seed --out --pfm
+Image     --width --height --noise --spp --min-spp --max-spp --bounces
+          --threads --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
 Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
 Animation --time --frames --orbits --tstep --loop --video --fps --no-png

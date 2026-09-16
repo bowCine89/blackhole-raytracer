@@ -34,9 +34,11 @@
 // ---------------------------------------------------------------------------
 struct Config {
     int   width = 1280, height = 720;
-    int   spp = 128;                 // with --noise this is the ceiling, not the count
-    Real  noise = 0;                 // >0: sample until this much output noise remains
+    int   spp = 128;                 // only consulted when a fixed count was asked for
+    bool  sppFixed = false;          // --spp (or --preview) was given explicitly
+    Real  noise = 1.0;               // target output noise, in 8-bit LSB
     int   minSpp = 16;               // samples before the variance estimate is trusted
+    int   maxSpp = 1024;             // ceiling on what --noise may spend
     int   maxBounces = 2;
     int   threads = 0;               // 0 = hardware concurrency
     uint64_t seed = 20260913;
@@ -502,9 +504,9 @@ static void usage() {
 "\n"
 "Image\n"
 "  --width N --height N        output resolution           (1280 720)\n"
-"  --spp N                     samples per pixel, or cap   (128)\n"
-"  --noise LSB                 stop at this much noise     (off)\n"
-"  --min-spp N                 min samples before stopping (16)\n"
+"  --noise LSB                 target output noise         (1.0)\n"
+"  --spp N                     fixed count; disables --noise\n"
+"  --min-spp N --max-spp N     adaptive floor and ceiling  (16 1024)\n"
 "  --bounces N                 disk scattering bounces     (2)\n"
 "  --threads N                 worker threads              (all cores)\n"
 "  --seed N                    RNG seed\n"
@@ -579,9 +581,10 @@ int main(int argc, char** argv) {
         std::string s = argv[i];
         if      (s == "--width")       c.width = needI(i);
         else if (s == "--height")      c.height = needI(i);
-        else if (s == "--spp")         c.spp = needI(i);
+        else if (s == "--spp")       { c.spp = needI(i); c.sppFixed = true; }
         else if (s == "--noise")       c.noise = needF(i);
         else if (s == "--min-spp")     c.minSpp = needI(i);
+        else if (s == "--max-spp")     c.maxSpp = needI(i);
         else if (s == "--bounces")     c.maxBounces = needI(i);
         else if (s == "--threads")     c.threads = needI(i);
         else if (s == "--seed")        c.seed = uint64_t(needI(i));
@@ -611,7 +614,8 @@ int main(int argc, char** argv) {
         else if (s == "--desat")       c.desat = needF(i);
         else if (s == "--rtol")        c.rtol = needF(i);
         else if (s == "--max-steps")   c.maxSteps = needI(i);
-        else if (s == "--preview")   { c.width = 480; c.height = 270; c.spp = 24; }
+        else if (s == "--preview")   { c.width = 480; c.height = 270;
+                                       c.spp = 24; c.sppFixed = true; }
         else if (s == "--check")       c.check = true;
         else if (s == "--quiet")       c.quiet = true;
         else if (s == "--stats")       c.stats = true;
@@ -685,8 +689,15 @@ int main(int argc, char** argv) {
         if (disk.edgeWidth > 0)
             std::printf("  outer edge        opaque to %.1f M, tau=1 at %.1f M, transparent by %.1f M\n",
                         disk.rOut - disk.edgeWidth * std::log(disk.tauMax), disk.rOut, disk.rCut);
-        std::printf("  image             %d x %d, %d spp, %d bounce%s, %d threads\n",
-                    c.width, c.height, c.spp, c.maxBounces, c.maxBounces == 1 ? "" : "s", nThreads);
+        char sampling[64];
+        if (!c.sppFixed && c.noise > 0)
+            std::snprintf(sampling, sizeof sampling, "<= %.2f LSB noise, %d spp cap",
+                          double(c.noise), c.maxSpp);
+        else
+            std::snprintf(sampling, sizeof sampling, "%d spp", c.spp);
+        std::printf("  image             %d x %d, %s, %d bounce%s, %d threads\n",
+                    c.width, c.height, sampling, c.maxBounces,
+                    c.maxBounces == 1 ? "" : "s", nThreads);
         std::fflush(stdout);
     }
 
@@ -767,7 +778,11 @@ int main(int argc, char** argv) {
     // Adaptive sampling carries two more per-pixel quantities: the sum of
     // squared luminance, which a variance can be built from, and how many
     // samples that pixel actually took.
-    const bool adaptive = c.noise > 0;
+    // Adaptive unless a count was named.  Asking for --spp has always meant
+    // "give me exactly this many", and it still does; everything else gets the
+    // noise target, which is the more useful thing to ask for.
+    const bool adaptive = !c.sppFixed && c.noise > 0;
+    const int  sppCap   = adaptive ? std::max(c.minSpp, c.maxSpp) : c.spp;
     std::vector<double> sumY2(adaptive ? size_t(W) * H : 0, 0.0);
     std::vector<int>    sppOf(adaptive ? size_t(W) * H : 0, 0);
 
@@ -963,30 +978,30 @@ int main(int argc, char** argv) {
     };
 
     if (!adaptive) {
-        runPass(0, c.spp, false, 0.0, "rendering");
+        runPass(0, sppCap, false, 0.0, "rendering");
     } else {
         // The stopping rule asks how much noise will *show*, which depends on
         // the tone curve, which depends on the image.  So a short fixed pass
         // goes first with no purpose but to give the exposure something to
         // meter; its samples are kept and counted like any others.
-        int boot = std::min(c.spp, std::max(4, c.minSpp));
+        int boot = std::min(sppCap, std::max(4, c.minSpp));
         runPass(0, boot, false, 0.0, "metering");
-        runPass(boot, c.spp, true, meterNow(), "rendering");
+        runPass(boot, sppCap, true, meterNow(), "rendering");
     }
 
     if (adaptive && !c.quiet) {
         long long total = 0;
-        int lo = c.spp, hi = 0, capped = 0;
+        int lo = sppCap, hi = 0, capped = 0;
         for (size_t i = 0; i < size_t(W) * H; ++i) {
             int n = sppOf[i];
             total += n; lo = std::min(lo, n); hi = std::max(hi, n);
-            if (n >= c.spp) ++capped;
+            if (n >= sppCap) ++capped;
         }
         double mean = double(total) / (double(W) * H);
         std::printf("\r  samples/pixel     %d min, %.1f mean, %d max   "
                     "(%.1f%% hit the %d cap, %.2fx the work of a flat %d)\n",
-                    lo, mean, hi, 100.0 * capped / (double(W) * H), c.spp,
-                    mean / c.spp, c.spp);
+                    lo, mean, hi, 100.0 * capped / (double(W) * H), sppCap,
+                    mean / sppCap, sppCap);
         std::fflush(stdout);
     }
 
