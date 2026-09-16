@@ -130,7 +130,40 @@ wheel         dolly in/out                           - / =   exposure
 ctrl+wheel    field of view                          b       scattering bounces
 r             reset camera                           s       save PNG(s)
 g             3D ray view (see below)                q       quit
+h / v         hero shot, 4K / VGA
 ```
+
+### The hero shot
+
+`h` renders a scripted camera move at 4K and streams it to
+`kerr-hero-4k.mp4`; `v` does the same at VGA into `kerr-hero-vga.mp4`. The move
+opens wide and below the disk plane, framed on the approaching side — which is
+the bright one, by about a factor of four at this inclination — then pushes in
+and rises through the plane, settling centred on the shadow.
+
+```
+  inclination   106° (below the plane)  ->  72° (above it)
+  radius         46 M  ->  24 M, geometrically
+  field of view  42°   ->  34°
+  aim            7° right of centre, easing to centred
+```
+
+The plane crossing lands near r = 33 M, comfortably outside the disk's outer
+edge at 18 M, so the camera passes over the rim rather than through it. The
+disk turns by plain advection for the whole minute: the cross-fade that
+[closes a loop](#making-the-loop-close) is *not* applied, because this shot does
+not loop and has no seam to hide.
+
+Frames are streamed to the encoder as they converge rather than kept. That is
+not an optimisation: a minute of 4K is 1440 frames of 24 MB, and holding them
+the way a bake does would want 35 GB. One frame is in memory at a time.
+
+**It is a long render.** 4K at 96 spp is about two minutes a frame on 32 cores,
+so a minute of footage is the better part of two days; the estimate is printed
+before the first frame so `ESC` can end it cheaply. `--hero-seconds`,
+`--hero-spp` and `--hero-span` trade that down, and `v` at VGA is roughly forty
+times cheaper for checking the move before committing to it. `--autohero 4k|vga`
+renders without a keypress and exits.
 
 ### Seeing the rays
 

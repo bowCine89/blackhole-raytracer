@@ -431,13 +431,14 @@ static double meterInitial(const Scene& sc, const CameraParams& cam, double key)
 //     PLAYING  -> space returns to live
 //
 // Escape backs out of whatever is happening without quitting.
-enum class Mode { Live, Baking, Playing, Rays };
+enum class Mode { Live, Baking, Playing, Rays, Hero };
 
 static const char* modeName(Mode m) {
     switch (m) {
         case Mode::Baking:  return "BAKING";
         case Mode::Playing: return "PLAYING";
         case Mode::Rays:    return "RAYS";
+        case Mode::Hero:    return "HERO";
         default:            return "live";
     }
 }
@@ -764,6 +765,60 @@ static void drawRayVis(SDL_Renderer* ren, const RayVis& rv,
     }
 }
 
+// ---------------------------------------------------------------------------
+// The hero shot
+// ---------------------------------------------------------------------------
+//
+// A scripted move, rendered at whatever resolution is asked for rather than at
+// the window's, and streamed to the video a frame at a time.  Streaming is not
+// an optimisation here: a minute of 4K is 1440 frames of 24 MB, and the bake's
+// habit of keeping every frame in memory would want 35 GB of it.
+//
+// The move starts below the disk plane looking up, framed on the approaching
+// side -- which is the bright one, by a factor of about four at the default
+// inclination -- then pushes in and rises through the plane, settling centred
+// on the shadow.  Crossing happens around r = 22 M, comfortably outside the
+// disk's outer edge at 18 M, so the camera passes over the rim rather than
+// through it.
+struct Hero {
+    bool   active = false;
+    int    w = 3840, h = 2160;      // 4K by default
+    int    frames = 1440;           // 60 s at 24 fps
+    int    idx = 0;
+    int    spp = 96;                // convergence before the clock advances
+    double fps = 24.0;
+    Real   tSpan = 48.0;            // coordinate time covered, about two ISCO orbits
+    Real   t0 = 0;
+    std::string path;
+    vid::VideoWriter vw;
+    bool   videoOpen = false;
+    double lockedExposure = 0;
+
+    // what to put back afterwards
+    int          saveW = 0, saveH = 0, saveScale = 1;
+    CameraParams saveCam;
+    Real         saveT = 0;
+    Clock::time_point began{};
+};
+
+// Position along the move, u running 0 to 1.  Smoothstep so it eases in and
+// out rather than starting and stopping abruptly; the radius moves
+// geometrically, because a linear sweep from 46 M to 11 M spends most of its
+// time far away and then lunges at the end.
+static CameraParams heroPose(const CameraParams& base, double u) {
+    double e = u * u * (3 - 2 * u);
+    CameraParams p = base;
+    p.incDeg   = 106.0 + (72.0 - 106.0) * e;      // below the plane, then above it
+    // 46 M to 24 M, not further.  The shadow is about 5 M across and at 11 M it
+    // overflows the frame entirely; ending at 24 M puts it at roughly two
+    // thirds of the half-height, which fills the frame without losing its shape.
+    p.camR     = Real(46.0 * std::pow(24.0 / 46.0, e));
+    p.fovDeg   = 42.0 + (34.0 - 42.0) * e;
+    p.yawDeg   = Real(-7.0 * (1.0 - e));          // negative aims right, at the glare
+    p.pitchDeg = 0;
+    return p;
+}
+
 struct Bake {
     std::vector<std::vector<uint8_t>> frames;   // tone-mapped, window-sized
     int    targetSpp = 64;       // convergence before the clock advances
@@ -843,6 +898,7 @@ static void printControls() {
 "  - / =                exposure\n"
 "  b                    cycle scattering bounces (0-4)\n"
 "  g                    3D ray view: see the geodesics this camera casts\n"
+"  h / v                hero shot, 4K / VGA, streamed to kerr-hero-*.mp4\n"
 "  r                    reset the camera\n"
 "  s                    save a PNG snapshot\n"
 "  q                    quit\n"
@@ -873,9 +929,13 @@ int main(int argc, char** argv) {
     int   bakeFrames = 96;   // frames per orbit
     std::string videoOut = "kerrbake.avi";   // .mp4 or .mkv here encodes H.265
     int    bakeCrf = 18;
+    double heroSeconds = 60.0;   // H and V render this much footage
+    int    heroSpp = 96;         // convergence per hero frame
+    Real   heroSpan = 48.0;      // coordinate time the move covers, ~2 ISCO orbits
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     bool   autoRays  = false;   // scripted: open the ray view straight away
+    std::string autoHero;       // scripted: "4k" or "vga", render and quit
     int    autoBake = 0;        // scripted: bake N frames, play, then quit
     double userExposure = 1.0, key = 1.3;
     int threads = 0;
@@ -911,11 +971,15 @@ int main(int argc, char** argv) {
         else if (a == "--video")      videoOut = argv[++i];
         else if (a == "--no-video")   videoOut.clear();
         else if (a == "--crf")        bakeCrf = nextI();
+        else if (a == "--hero-seconds") heroSeconds = nextF();
+        else if (a == "--hero-spp")     heroSpp = nextI();
+        else if (a == "--hero-span")    heroSpan = nextF();
         else if (a == "--autobake")   autoBake = nextI();
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
         else if (a == "--autoorbit")  autoOrbit = true;
         else if (a == "--autorays")   autoRays = true;
+        else if (a == "--autohero")   autoHero = argv[++i];
         else if (a == "--rtol")       sc.prop.rtol = nextF();
         else if (a == "--help" || a == "-h") {
             std::printf(
@@ -927,6 +991,8 @@ int main(int argc, char** argv) {
 "  --bounces N --sky-gain F --nostars\n"
 "  --exposure F --fps F --threads N --rtol F\n"
 "  --autorays             open the 3D ray view at startup\n"
+"  --autohero 4k|vga      render the hero shot and exit\n"
+"  --hero-seconds F --hero-spp N --hero-span M\n"
 "  --video F --no-video --crf N    bake output; .mp4/.mkv encode H.265\n");
             printControls();
             return 0;
@@ -1003,6 +1069,7 @@ int main(int argc, char** argv) {
 
     Mode   mode = Mode::Live;
     RayVis rayVis;
+    Hero   hero;
     // Leaving flies the inspection camera back to the viewpoint the rays were
     // launched from, and only then hands over to the traced image -- which is
     // rendered from exactly that pose, so the cut lands on a matching frame.
@@ -1046,6 +1113,99 @@ int main(int argc, char** argv) {
     bool  running = true;
     int   snapshotIndex = 0;
 
+    // A scripted hero shot has nothing to do afterwards, so it exits.
+    // A scripted hero exits when it is done, unless --autoquit says the run
+    // has something else to do afterwards -- which is how the return to
+    // ordinary viewing gets exercised.
+    const bool heroThenQuit = !autoHero.empty() && autoQuit <= 0;
+
+    // Put the viewer back the way it was, and close the container.
+    auto heroFinish = [&](const char* why) {
+        if (hero.videoOpen) {
+            if (!hero.vw.close())
+                std::printf("\n  hero: the encoder reported a failure; %s may be truncated\n",
+                            hero.path.c_str());
+            hero.videoOpen = false;
+        }
+        reconfigure(S, [&] {
+            S.rt.winW = hero.saveW; S.rt.winH = hero.saveH; S.rt.scale = hero.saveScale;
+            S.display.assign(size_t(hero.saveW) * hero.saveH * 3, 0u);
+            S.present = S.display;
+            camWanted = hero.saveCam;
+            tWanted   = hero.saveT;
+            S.cam        = camWanted;
+            S.cam.aspect = Real(hero.saveW) / std::max(1, hero.saveH);
+            S.tObs       = tWanted;
+            // passLimit is normally maintained by the regime block further
+            // down, which this mode never reaches.  Leaving a stale cap here
+            // parks every worker the moment the counter passes it.
+            S.passLimit.store(0, std::memory_order_relaxed);
+            resetAccumulation(S);
+        });
+        std::printf("\n  hero: %s -- %d frames to %s (%.0f s)\n",
+                    why, hero.idx, hero.path.c_str(), since(hero.began));
+        std::fflush(stdout);
+        hero.active = false;
+        mode = Mode::Live;
+        // Deliberately not touching lastInput.  Doing so makes `moving` true,
+        // the regime block then caps dispatch to one item per tile, and once
+        // moving lapses nothing fires again to lift the cap -- the workers
+        // finish a single pass and park for good.  Marking the scene dirty
+        // instead gets one settled pass through that block, which clears it.
+        sceneDirty = true;
+        if (heroThenQuit) running = false;
+    };
+
+    // Set the move going at the given resolution.  The estimate is printed
+    // before the first frame on purpose: a minute of 4K is a very long job, and
+    // ESC is a lot cheaper to press now than in an hour.
+    auto heroStart = [&](int hw, int hh, const char* label) {
+        if (mode != Mode::Live) return;
+        hero = Hero{};
+        hero.w = hw; hero.h = hh;
+        hero.fps = 24.0;
+        hero.frames = std::max(2, int(heroSeconds * hero.fps + 0.5));
+        hero.spp = std::max(1, heroSpp);
+        hero.tSpan = heroSpan;
+        hero.t0 = tWanted;
+        hero.path = std::string("kerr-hero-") + label + ".mp4";
+        hero.saveW = S.rt.winW; hero.saveH = S.rt.winH; hero.saveScale = S.rt.scale;
+        hero.saveCam = camWanted; hero.saveT = tWanted;
+        hero.began = Clock::now();
+
+        hero.vw.crf = bakeCrf;
+        hero.videoOpen = hero.vw.open(hero.path, hw, hh, hero.fps);
+        if (!hero.videoOpen) {
+            std::printf("  hero: cannot open %s for writing\n", hero.path.c_str());
+            std::fflush(stdout);
+            return;
+        }
+
+        double rays = double(hw) * hh * hero.spp * hero.frames;
+        double est  = rays / std::max(1.0e5, raysPerSec);
+        std::printf("\n  hero: %dx%d, %d frames at %.0f fps (%.0f s of footage), %d spp\n"
+                    "        %.1f Gray total, about %.1f h at the current rate -- ESC to abandon\n",
+                    hw, hh, hero.frames, hero.fps, hero.frames / hero.fps, hero.spp,
+                    rays / 1e9, est / 3600.0);
+        std::fflush(stdout);
+
+        camWanted = heroPose(home, 0.0);
+        tWanted   = hero.t0;
+        reconfigure(S, [&] {
+            S.rt.winW = hw; S.rt.winH = hh; S.rt.scale = 1;
+            S.display.assign(size_t(hw) * hh * 3, 0u);
+            S.present = S.display;
+            S.cam        = camWanted;
+            S.cam.aspect = Real(hw) / hh;
+            S.tObs       = tWanted;
+            S.scene.disk.loopPeriod = 0;   // no loop trick: the disk simply turns
+            S.passLimit.store(0, std::memory_order_relaxed);   // converge, uncapped
+            resetAccumulation(S);
+        });
+        hero.active = true;
+        mode = Mode::Hero;
+    };
+
     auto startTime = Clock::now();
     while (running) {
         // Meter first, on whatever the workers produced since the last reset.
@@ -1087,6 +1247,50 @@ int main(int argc, char** argv) {
                 std::printf("  rays: back to live\n");
                 std::fflush(stdout);
             }
+        }
+
+        // --- the hero shot ------------------------------------------------
+        if (mode == Mode::Hero && hero.active) {
+            // The exposure is deliberately *not* frozen here, unlike a bake.
+            // A bake holds the camera still, so freezing keeps playback from
+            // flickering; this move triples the disk's share of the frame on the
+            // way in, and a level metered from the wide shot burns the close-up
+            // to white.  The viewer's metering is already smoothed over time,
+            // which is what keeps the adjustment from showing.
+            if (S.minCount.load(std::memory_order_relaxed) >= uint32_t(hero.spp)) {
+                bool finished = false;
+                // The frame is taken with the workers parked; reading display
+                // while they paint it would tear.
+                reconfigure(S, [&] {
+                    if (hero.videoOpen) hero.vw.addFrame(S.display.data());
+                    ++hero.idx;
+                    if (hero.idx >= hero.frames) { finished = true; return; }
+                    double u   = double(hero.idx) / double(std::max(1, hero.frames - 1));
+                    camWanted  = heroPose(home, u);
+                    tWanted    = hero.t0 + hero.tSpan * (double(hero.idx) / hero.frames);
+                    S.cam        = camWanted;
+                    S.cam.aspect = Real(hero.w) / hero.h;
+                    S.tObs       = tWanted;
+                    S.passLimit.store(0, std::memory_order_relaxed);
+                    resetAccumulation(S);
+                });
+                if (hero.idx % 10 == 0 || finished) {
+                    double el = since(hero.began);
+                    double eta = hero.idx > 0 ? el / hero.idx * (hero.frames - hero.idx) : 0;
+                    std::printf("\r  hero  %d/%d   %.0f%%   %.0f s elapsed, %.0f s left    ",
+                                hero.idx, hero.frames, 100.0 * hero.idx / hero.frames, el, eta);
+                    std::fflush(stdout);
+                }
+                if (finished) heroFinish("done");
+            }
+        }
+
+        // Scripted hero shot, so it can be rendered without a hand on the keyboard.
+        if (!autoHero.empty() && mode == Mode::Live && !hero.active
+            && since(startTime) > 0.4) {
+            if (autoHero == "4k") heroStart(3840, 2160, "4k");
+            else                  heroStart(640, 480, "vga");
+            autoHero.clear();
         }
 
         // Scripted ray view, so it can be exercised without a hand on the mouse.
@@ -1257,6 +1461,7 @@ int main(int argc, char** argv) {
 
                 // Escape backs out of whatever is happening, without quitting.
                 case SDLK_ESCAPE:
+                    if (mode == Mode::Hero && hero.active) { heroFinish("abandoned"); break; }
                     if (mode == Mode::Rays) {
                         mode = Mode::Live;
                         raysLeaving = false;
@@ -1277,6 +1482,8 @@ int main(int argc, char** argv) {
                     }
                     break;
                 case SDLK_r: camWanted = home; camChanged = true; break;
+                case SDLK_h: heroStart(3840, 2160, "4k");  break;
+                case SDLK_v: heroStart(640,  480,  "vga"); break;
                 case SDLK_g:
                     if (mode == Mode::Live) {
                         // Capture with the workers parked: the scene is only
@@ -1477,7 +1684,7 @@ int main(int argc, char** argv) {
         // latency (~25 ms).  A scale change still applies at once, since the
         // buffers have to be resized anyway.
         bool passComplete = S.work.load(std::memory_order_relaxed) >= uint64_t(S.numTiles);
-        if (camChanged && mode != Mode::Rays) sceneDirty = true;
+        if (camChanged && mode != Mode::Rays && mode != Mode::Hero) sceneDirty = true;
 
         if ((passComplete && (sceneDirty || moving)) || desiredScale != S.rt.scale) {
             reconfigure(S, [&] {
@@ -1544,7 +1751,21 @@ int main(int argc, char** argv) {
             // visible as it happens.
             // The visualiser draws vectors rather than a frame buffer, so it
             // bypasses the streaming texture entirely.
-            if (mode == Mode::Rays) {
+            if (mode == Mode::Hero) {
+                // The render target is the hero resolution, not the window's, so
+                // there is nothing here the streaming texture could show.  A bar
+                // is more use than a stretched corner of a 4K frame.
+                SDL_SetRenderDrawColor(ren, 8, 8, 10, 255);
+                SDL_RenderClear(ren);
+                double f = double(hero.idx) / std::max(1, hero.frames);
+                int bw = winW - 80, bx = 40, by = winH / 2 - 14;
+                SDL_Rect bg{bx, by, bw, 28};
+                SDL_SetRenderDrawColor(ren, 38, 38, 46, 255);
+                SDL_RenderFillRect(ren, &bg);
+                SDL_Rect fg{bx, by, int(bw * f), 28};
+                SDL_SetRenderDrawColor(ren, 255, 176, 64, 255);
+                SDL_RenderFillRect(ren, &fg);
+            } else if (mode == Mode::Rays) {
                 drawRayVis(ren, rayVis, camWanted, winW, winH);
             } else {
                 const uint8_t* src;
@@ -1594,6 +1815,13 @@ int main(int argc, char** argv) {
                     bake.frames.size() + 1, bake.maxFrames,
                     S.minCount.load(), bake.targetSpp,
                     double(bake.span() / period), bake.bytes() / 1.0e6);
+                break;
+            case Mode::Hero:
+                std::snprintf(title, sizeof title,
+                    "HERO  |  %d/%d  |  %dx%d  |  %u/%d spp  |  %.0f%%  |  ESC to abandon",
+                    hero.idx, hero.frames, hero.w, hero.h,
+                    S.minCount.load(), hero.spp,
+                    100.0 * hero.idx / std::max(1, hero.frames));
                 break;
             case Mode::Rays:
                 std::snprintf(title, sizeof title,
