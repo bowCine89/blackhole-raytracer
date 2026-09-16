@@ -34,7 +34,9 @@
 // ---------------------------------------------------------------------------
 struct Config {
     int   width = 1280, height = 720;
-    int   spp = 128;
+    int   spp = 128;                 // with --noise this is the ceiling, not the count
+    Real  noise = 0;                 // >0: sample until this much output noise remains
+    int   minSpp = 16;               // samples before the variance estimate is trusted
     int   maxBounces = 2;
     int   threads = 0;               // 0 = hardware concurrency
     uint64_t seed = 20260913;
@@ -500,7 +502,9 @@ static void usage() {
 "\n"
 "Image\n"
 "  --width N --height N        output resolution           (1280 720)\n"
-"  --spp N                     samples per pixel           (128)\n"
+"  --spp N                     samples per pixel, or cap   (128)\n"
+"  --noise LSB                 stop at this much noise     (off)\n"
+"  --min-spp N                 min samples before stopping (16)\n"
 "  --bounces N                 disk scattering bounces     (2)\n"
 "  --threads N                 worker threads              (all cores)\n"
 "  --seed N                    RNG seed\n"
@@ -576,6 +580,8 @@ int main(int argc, char** argv) {
         if      (s == "--width")       c.width = needI(i);
         else if (s == "--height")      c.height = needI(i);
         else if (s == "--spp")         c.spp = needI(i);
+        else if (s == "--noise")       c.noise = needF(i);
+        else if (s == "--min-spp")     c.minSpp = needI(i);
         else if (s == "--bounces")     c.maxBounces = needI(i);
         else if (s == "--threads")     c.threads = needI(i);
         else if (s == "--seed")        c.seed = uint64_t(needI(i));
@@ -758,6 +764,12 @@ int main(int argc, char** argv) {
     // --- render -----------------------------------------------------------
     const int W = c.width, H = c.height;
     std::vector<double> xyzBuf(size_t(W) * H * 3, 0.0);
+    // Adaptive sampling carries two more per-pixel quantities: the sum of
+    // squared luminance, which a variance can be built from, and how many
+    // samples that pixel actually took.
+    const bool adaptive = c.noise > 0;
+    std::vector<double> sumY2(adaptive ? size_t(W) * H : 0, 0.0);
+    std::vector<int>    sppOf(adaptive ? size_t(W) * H : 0, 0);
 
     const int TILE = 16;
     const int tilesX = (W + TILE - 1) / TILE, tilesY = (H + TILE - 1) / TILE;
@@ -767,10 +779,38 @@ int main(int argc, char** argv) {
 
     const Real ybarInt = spec::ybarIntegral();
     const Real lamScale = spec::LAMBDA_SPAN / ybarInt;
+    // What one raw accumulated sample is worth once it becomes luminance.
+    const double kY = double(lamScale) / spec::NLAMBDA;
+
+    // How much 8-bit noise is left in a pixel.  The standard error of the mean
+    // is pushed through the same tone curve the image will get, so the answer
+    // is in the units someone looking at the picture actually sees: one LSB
+    // means the sampling noise moves the final pixel by about one step in 255.
+    // Luminance stands in for the three channels, which is accurate enough to
+    // decide when to stop and much cheaper than tracking all three variances.
+    auto noiseLsb = [](double meanY, double stderrY, double scale) {
+        double a = spec::srgbEncode(spec::acesFilmic(std::max(0.0, scale * meanY)));
+        double b = spec::srgbEncode(spec::acesFilmic(std::max(0.0, scale * (meanY + stderrY))));
+        return 255.0 * std::fabs(b - a);
+    };
+
+    // The exposure the image would be given if it were tone mapped right now.
+    // xyzBuf holds sums while rendering, so this divides as it goes.
+    auto meterNow = [&]() {
+        std::vector<double> l;
+        l.reserve(size_t(W) * H);
+        for (size_t i = 0; i < size_t(W) * H; ++i) {
+            int n = adaptive ? std::max(1, sppOf[i]) : c.spp;
+            l.push_back(xyzBuf[i * 3 + 1] * kY / n);
+        }
+        std::sort(l.begin(), l.end());
+        double k = l[std::min(l.size() - 1, size_t(l.size() * c.percentile))];
+        return (k > 0 ? double(c.key) / k : 1.0) * double(c.exposure);
+    };
 
     auto t0 = std::chrono::steady_clock::now();
 
-    auto worker = [&](int tid) {
+    auto worker = [&](int tid, int sFrom, int sTo, bool stopEarly, double scale) {
         uint64_t localRays = 0, localSteps = 0;
         for (;;) {
             int ti = nextTile.fetch_add(1, std::memory_order_relaxed);
@@ -794,7 +834,16 @@ int main(int argc, char** argv) {
                     auto sampleOf = [&](int s, Real* lam, Real& sx, Real& sy) {
                         Real u1 = rx + 0.7548776662 * (s + 1); u1 -= std::floor(u1);
                         Real u2 = ry + 0.5698402910 * (s + 1); u2 -= std::floor(u2);
-                        Real ul = rl + (s + 0.5) / c.spp;      ul -= std::floor(ul);
+                        // Stratifying the wavelength as (s + 0.5)/spp assumes the
+                        // total is known in advance.  Adaptively it is not, and a
+                        // pixel that stops at n < spp would then have sampled only
+                        // n/spp of the band per lobe -- a colour bias, not just
+                        // noise.  The golden-ratio additive sequence is instead
+                        // well spread for *every* prefix length, so stopping early
+                        // costs nothing.  Fixed --spp keeps the original lattice.
+                        Real ul = adaptive ? rl + 0.6180339887498949 * (s + 1)
+                                           : rl + (s + 0.5) / c.spp;
+                        ul -= std::floor(ul);
                         for (int k = 0; k < spec::NLAMBDA; ++k) {
                             Real f = ul + Real(k) / spec::NLAMBDA;
                             f -= std::floor(f);
@@ -804,50 +853,82 @@ int main(int argc, char** argv) {
                         sy = 1.0 - 2.0 * (y + u2) / H;
                     };
 
-                    if (c.simd) {
-                        // Eight samples of this pixel travel together.  They
-                        // differ only by sub-pixel jitter and wavelength, and
-                        // wavelength does not enter the geodesic at all, so the
-                        // eight trajectories stay tightly coherent.
-                        for (int s = 0; s < c.spp; s += LANES) {
-                            int n = std::min(LANES, c.spp - s);
+                    // Sampling runs in batches so that, with --noise on, a
+                    // pixel can stop as soon as its own estimate is quiet
+                    // enough.  Empty sky settles in a couple of batches; the
+                    // caustics round the photon ring take the whole budget.
+                    const int batch = c.simd ? LANES : 4;
+                    double sumY = 0, sumYY = 0;
+                    int taken = 0;
+                    while (taken < sTo - sFrom) {
+                        int n = std::min(batch, (sTo - sFrom) - taken);
+                        Real perY[LANES];
+                        if (c.simd) {
                             Geodesic gp[LANES];
                             Real lam[LANES][spec::NLAMBDA];
                             Rng  rgs[LANES];
                             for (int j = 0; j < n; ++j) {
                                 Real sx, sy;
-                                sampleOf(s + j, lam[j], sx, sy);
+                                sampleOf(sFrom + taken + j, lam[j], sx, sy);
                                 gp[j] = cam.ray(sx, sy);
                                 rgs[j] = Rng(uint64_t(y) * W + x + 1,
-                                             c.seed + uint64_t(s + j) * 0x9E3779B97F4A7C15ull);
+                                             c.seed + uint64_t(sFrom + taken + j)
+                                                      * 0x9E3779B97F4A7C15ull);
                             }
                             Real rad[LANES][spec::NLAMBDA];
                             tracePacket(kerr, disk, sky, prop, gp, lam, rgs,
                                         c.maxBounces, n, rad, c.tObs, &localSteps);
-                            for (int j = 0; j < n; ++j)
+                            for (int j = 0; j < n; ++j) {
+                                Vec3 v{0, 0, 0};
                                 for (int k = 0; k < spec::NLAMBDA; ++k)
-                                    if (rad[j][k] > 0) xyz += spec::cieXYZ(lam[j][k]) * rad[j][k];
+                                    if (rad[j][k] > 0) v += spec::cieXYZ(lam[j][k]) * rad[j][k];
+                                xyz += v;
+                                perY[j] = v.y;
+                            }
                             localRays += uint64_t(n);
+                        } else {
+                            for (int j = 0; j < n; ++j) {
+                                Real lam[spec::NLAMBDA], sx, sy;
+                                sampleOf(sFrom + taken + j, lam, sx, sy);
+                                Geodesic g = cam.ray(sx, sy);
+                                Real rad[spec::NLAMBDA];
+                                tracePath(kerr, disk, sky, prop, g, lam, rad, rng,
+                                          c.maxBounces, c.tObs, &localSteps);
+                                Vec3 v{0, 0, 0};
+                                for (int k = 0; k < spec::NLAMBDA; ++k)
+                                    if (rad[k] > 0) v += spec::cieXYZ(lam[k]) * rad[k];
+                                xyz += v;
+                                perY[j] = v.y;
+                                ++localRays;
+                            }
                         }
-                    } else {
-                        for (int s = 0; s < c.spp; ++s) {
-                            Real lam[spec::NLAMBDA], sx, sy;
-                            sampleOf(s, lam, sx, sy);
-                            Geodesic g = cam.ray(sx, sy);
-                            Real rad[spec::NLAMBDA];
-                            tracePath(kerr, disk, sky, prop, g, lam, rad, rng,
-                                      c.maxBounces, c.tObs, &localSteps);
-                            for (int k = 0; k < spec::NLAMBDA; ++k)
-                                if (rad[k] > 0) xyz += spec::cieXYZ(lam[k]) * rad[k];
-                            ++localRays;
+                        for (int j = 0; j < n; ++j) { sumY += perY[j]; sumYY += double(perY[j]) * perY[j]; }
+                        taken += n;
+
+                        if (stopEarly) {
+                            size_t pi = size_t(y) * W + x;
+                            int    nAll  = sppOf[pi] + taken;
+                            double sAll  = xyzBuf[pi * 3 + 1] + sumY;
+                            double ssAll = sumY2[pi] + sumYY;
+                            if (nAll >= c.minSpp) {
+                                double mean = sAll / nAll;
+                                double var  = (ssAll - sAll * mean) / double(nAll - 1);
+                                if (var < 0) var = 0;
+                                double se = std::sqrt(var / nAll) * kY;
+                                if (noiseLsb(mean * kY, se, scale) <= c.noise) break;
+                            }
                         }
                     }
 
-                    Real inv = lamScale / (Real(c.spp) * spec::NLAMBDA);
                     size_t o = (size_t(y) * W + x) * 3;
-                    xyzBuf[o + 0] = xyz.x * inv;
-                    xyzBuf[o + 1] = xyz.y * inv;
-                    xyzBuf[o + 2] = xyz.z * inv;
+                    xyzBuf[o + 0] += xyz.x;
+                    xyzBuf[o + 1] += xyz.y;
+                    xyzBuf[o + 2] += xyz.z;
+                    if (adaptive) {
+                        size_t pi = size_t(y) * W + x;
+                        sumY2[pi]    += sumYY;
+                        sppOf[pi]    += taken;
+                    }
                 }
             }
             doneTiles.fetch_add(1, std::memory_order_relaxed);
@@ -856,25 +937,68 @@ int main(int argc, char** argv) {
         stepsTaken.fetch_add(localSteps, std::memory_order_relaxed);
     };
 
-    std::vector<std::thread> pool;
-    pool.reserve(nThreads);
-    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
-
-    if (!c.quiet) {
-        int last = -1;
-        while (true) {
-            int d = doneTiles.load(std::memory_order_relaxed);
-            int pct = int(100.0 * d / nTiles);
-            if (pct != last) {
-                std::printf("\r  rendering        %3d%%", pct);
-                std::fflush(stdout);
-                last = pct;
+    auto runPass = [&](int sFrom, int sTo, bool stopEarly, double scale, const char* label) {
+        if (sTo <= sFrom) return;
+        nextTile.store(0, std::memory_order_relaxed);
+        doneTiles.store(0, std::memory_order_relaxed);
+        std::vector<std::thread> pool;
+        pool.reserve(nThreads);
+        for (int t = 0; t < nThreads; ++t)
+            pool.emplace_back(worker, t, sFrom, sTo, stopEarly, scale);
+        if (!c.quiet) {
+            int last = -1;
+            while (true) {
+                int d = doneTiles.load(std::memory_order_relaxed);
+                int pct = int(100.0 * d / nTiles);
+                if (pct != last) {
+                    std::printf("\r  %-16s %3d%%", label, pct);
+                    std::fflush(stdout);
+                    last = pct;
+                }
+                if (d >= nTiles) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(120));
             }
-            if (d >= nTiles) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(120));
         }
+        for (auto& t : pool) t.join();
+    };
+
+    if (!adaptive) {
+        runPass(0, c.spp, false, 0.0, "rendering");
+    } else {
+        // The stopping rule asks how much noise will *show*, which depends on
+        // the tone curve, which depends on the image.  So a short fixed pass
+        // goes first with no purpose but to give the exposure something to
+        // meter; its samples are kept and counted like any others.
+        int boot = std::min(c.spp, std::max(4, c.minSpp));
+        runPass(0, boot, false, 0.0, "metering");
+        runPass(boot, c.spp, true, meterNow(), "rendering");
     }
-    for (auto& t : pool) t.join();
+
+    if (adaptive && !c.quiet) {
+        long long total = 0;
+        int lo = c.spp, hi = 0, capped = 0;
+        for (size_t i = 0; i < size_t(W) * H; ++i) {
+            int n = sppOf[i];
+            total += n; lo = std::min(lo, n); hi = std::max(hi, n);
+            if (n >= c.spp) ++capped;
+        }
+        double mean = double(total) / (double(W) * H);
+        std::printf("\r  samples/pixel     %d min, %.1f mean, %d max   "
+                    "(%.1f%% hit the %d cap, %.2fx the work of a flat %d)\n",
+                    lo, mean, hi, 100.0 * capped / (double(W) * H), c.spp,
+                    mean / c.spp, c.spp);
+        std::fflush(stdout);
+    }
+
+    // xyzBuf carried sums while rendering; make it the mean everything below
+    // reads it as.
+    for (size_t i = 0; i < size_t(W) * H; ++i) {
+        double n = adaptive ? double(std::max(1, sppOf[i])) : double(c.spp);
+        double inv = double(lamScale) / (n * spec::NLAMBDA);
+        xyzBuf[i * 3 + 0] *= inv;
+        xyzBuf[i * 3 + 1] *= inv;
+        xyzBuf[i * 3 + 2] *= inv;
+    }
 
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();

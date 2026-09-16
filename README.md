@@ -1087,6 +1087,45 @@ compared the way the disk-edge change was: their difference is **9× smaller tha
 the noise floor** measured between two seeds of the same build (3.3% against
 29.7% mean), with image means agreeing to 0.16%.
 
+### Spending samples where they are needed
+
+`--spp` gives every pixel the same budget, which is the wrong shape for this
+image: most of the frame is empty sky that is converged after a handful of
+samples, while the caustics around the photon ring are still moving at five
+hundred. `--noise` replaces the fixed count with a target, and each pixel stops
+when it reaches it:
+
+```sh
+./kerr --noise 1 --spp 512
+```
+
+The target is in **output LSB**, not in samples or in radiance. Each pixel
+tracks the variance of its own luminance estimates, and the standard error of
+the mean is pushed through the same ACES and sRGB curves the image will get, so
+`--noise 1` reads as *"stop once sampling noise moves this pixel by less than
+one step in 255"* — a statement about what will be visible rather than about the
+integrator. `--spp` becomes the ceiling and `--min-spp` the floor, since a
+variance built from four samples is not worth believing.
+
+Measured at 480×270 against a 4096-spp reference:
+
+| | mean spp | rms | p99 | p99.9 |
+|---|--:|--:|--:|--:|
+| `--noise 1 --spp 512` | 53.5 | **0.71** | 2 | 6 |
+| flat `--spp 54`, the same cost | 54 | 1.63 | 6 | 20 |
+
+Same work, **2.3× less noise**, and three times better in the tail — because
+the samples went to the 3% of pixels that needed them instead of being spread
+evenly over a frame that is mostly sky.
+
+Two things worth knowing. The criterion bounds the *estimated standard error*,
+so it is a one-sigma statement: a small fraction of pixels will land two or
+three times over the target, which is what the p99 column shows. And the stop
+needs the tone curve, which needs an image, so a short fixed pass runs first to
+give the exposure something to meter — its samples are kept and counted, not
+thrown away. Without `--noise` none of this engages and the renderer is
+bit-for-bit what it was.
+
 ### Where the remaining headroom is
 
 Divergence is now the visible cost: 78 steps per ray against the 60 a scalar
@@ -1100,7 +1139,8 @@ compaction is paid for.
 ## Options
 
 ```
-Image     --width --height --spp --bounces --threads --seed --out --pfm
+Image     --width --height --spp --noise --min-spp --bounces --threads
+          --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
 Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
 Animation --time --frames --orbits --tstep --loop --video --fps --no-png
