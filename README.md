@@ -686,6 +686,13 @@ a black field, which is exactly the content that shows 8-bit banding; the extra
 depth costs almost nothing and gives the encoder room to dither rather than
 contour.
 
+4:2:0 keeps the chroma planes at half resolution and so cannot represent an odd
+width or height at all — x265 does not pad, it refuses to open, and the encode
+fails after every frame has already been rendered. An odd-sized render therefore
+switches to `yuv444p10le`, which subsamples nothing and takes any size. The file
+is larger; the alternative is cropping or padding a row and quietly returning a
+different picture than the one asked for.
+
 This is the one place the project asks for something it does not ship. An HEVC
 encoder does not belong in a header, and linking libx265 would end the habit of
 building with nothing installed — so ffmpeg is a **runtime** dependency and an

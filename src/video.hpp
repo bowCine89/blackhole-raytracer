@@ -204,13 +204,24 @@ public:
         path_ = path;
         frameBytes_ = size_t(w_) * h_ * 3;
 
+        // 4:2:0 stores the chroma planes at half resolution, so it cannot
+        // represent an odd width or height at all -- x265 does not pad, it
+        // refuses to open, and the whole encode fails after the frames have
+        // been rendered.  4:4:4 subsamples nothing and takes any size.  The
+        // file is bigger, which is the right trade for a frame that cost
+        // seconds: the alternative is padding or cropping a row, and silently
+        // returning a different picture than the one that was asked for.
+        oddSize_ = (w_ & 1) || (h_ & 1);
+        const char* pix = oddSize_ ? (tenBit ? "yuv444p10le" : "yuv444p")
+                                   : (tenBit ? "yuv420p10le" : "yuv420p");
+
         char buf[1024];
         std::snprintf(buf, sizeof buf,
             "%s -hide_banner -loglevel error -y -f rawvideo -pix_fmt rgb24 "
             "-s %dx%d -r %.6f -i - -an -c:v libx265 -preset %s -crf %d "
             "-pix_fmt %s -x265-params log-level=error -tag:v hvc1 %s",
             quote(exe()).c_str(), w_, h_, fps_, preset.c_str(), crf,
-            tenBit ? "yuv420p10le" : "yuv420p", quote(path_).c_str());
+            pix, quote(path_).c_str());
 
 #if !defined(_WIN32)
         // If the encoder dies mid-sequence the next write hits a broken pipe,
@@ -250,6 +261,7 @@ public:
 
     int    frames() const { return frames_; }
     size_t bytes()  const { return bytes_; }
+    bool   oddSize() const { return oddSize_; }
 
 private:
     // Shell-quote a path.  Single quotes everywhere but Windows, which does not
@@ -269,7 +281,7 @@ private:
     int w_ = 0, h_ = 0, frames_ = 0;
     double fps_ = 24.0;
     size_t frameBytes_ = 0, bytes_ = 0;
-    bool   broken_ = false;
+    bool   broken_ = false, oddSize_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -310,7 +322,9 @@ public:
     int    frames() const             { return h265_ ? hev_.frames()      : avi_.frames(); }
     size_t bytes()  const             { return h265_ ? hev_.bytes()       : avi_.bytes(); }
     bool   compressed() const         { return h265_; }
-    const char* codec() const         { return h265_ ? "H.265" : "uncompressed"; }
+    bool   oddSize() const            { return h265_ && hev_.oddSize(); }
+    const char* codec() const         { return h265_ ? (hev_.oddSize() ? "H.265 4:4:4"
+                                                                      : "H.265") : "uncompressed"; }
 
 private:
     bool h265_ = false;
