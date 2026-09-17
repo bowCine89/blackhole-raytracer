@@ -144,6 +144,11 @@ struct Shared {
 
     // Observer coordinate time, in M.  Mutated only under the pause barrier.
     Real tObs = 0.0;
+    // Width in coordinate time of the exposure behind one frame.  Zero in live
+    // mode, which has no frame interval; set for a hero frame so the samples of
+    // a pixel spread across the time the shutter is open and the turning disk
+    // blurs instead of strobing.
+    Real shutter = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -218,6 +223,7 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
             Geodesic gp[LANES];
             Real     lam[LANES][spec::NLAMBDA];
             Rng      rgs[LANES];
+            Real     tOb[LANES];
             size_t   idxs[LANES];
 
             for (int j = 0; j < n; ++j) {
@@ -237,6 +243,9 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
                 Real ul = fract(0.6180339887 * Real(sampleIdx) + o3);
 
                 rgs[j] = Rng(idx + 1, sc.seed + sampleIdx * 0x9E3779B97F4A7C15ull);
+                Real ut = fract(0.8191725134 * Real(sampleIdx)
+                                + hashFloat(hashU32(h ^ 0xc2b2ae35u)));
+                tOb[j] = S.tObs + (ut - Real(0.5)) * S.shutter;
                 for (int k = 0; k < spec::NLAMBDA; ++k) {
                     Real f = ul + Real(k) / spec::NLAMBDA; f -= std::floor(f);
                     lam[j][k] = spec::LAMBDA_MIN + spec::LAMBDA_SPAN * f;
@@ -249,7 +258,7 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
 
             Real rad[LANES][spec::NLAMBDA];
             tracePacket(sc.kerr, sc.disk, sc.sky, sc.prop, gp, lam, rgs,
-                        sc.maxBounces, n, rad, S.tObs);
+                        sc.maxBounces, n, rad, tOb);
             traced += uint64_t(n);
 
             for (int j = 0; j < n; ++j) shade(idxs[j], x + j, y, lam[j], rad[j]);
@@ -872,7 +881,7 @@ struct Hero {
     int    idx = 0;
     int    spp = 96;                // convergence before the clock advances
     double fps = 24.0;
-    Real   tSpan = 48.0;            // coordinate time covered, about two ISCO orbits
+    Real   tSpan = 960.0;           // coordinate time covered; see heroRate
     Real   t0 = 0;
     std::string path;
     vid::VideoWriter vw;
@@ -1024,8 +1033,38 @@ int main(int argc, char** argv) {
     int    bakeCrf = 18;
     double heroSeconds = 60.0;   // H and V render this much footage
     int    heroSpp = 512;        // ceiling; --hero-noise decides when to stop short
-    Real   heroSpan = 48.0;      // coordinate time the move covers, ~2 ISCO orbits
+    // Coordinate time the disk advances per *second of footage*, rather than
+    // over the whole move, so a short test render turns at the same rate as the
+    // full minute instead of sprinting through the same span in fewer frames.
+    //
+    // 72 M/s turns the inner edge of the disk three times a second, which is
+    // the rate this shot is cut for.  The ISCO period at a = 0.94 is 24 M, so
+    // three turns is 72 M; the outer rim, thirty times slower, comes round
+    // about once every seven seconds.
+    //
+    // At 24 fps that is 3 M per frame, and the inner edge sweeps 45 degrees
+    // between frames.  The mottling's dominant octave has 16 features around
+    // the disk, one every 22.5 degrees, so the inner disk is under-sampled at
+    // one instant per frame -- measured, the frame-to-frame image difference
+    // stops growing with the time step past about 1.5 M per frame, which is
+    // exactly the pattern ceasing to be resolved.  Only the inside is: the
+    // feature-crossing time runs from 1.5 M at the ISCO to 30 M at the rim, so
+    // everything outside r = 6 M or so is sampled perfectly well.
+    //
+    // The shutter is what makes the rate usable.  Each frame spreads its
+    // samples across the exposure, so the rotation is integrated rather than
+    // sampled at an instant, and the blur scales with the local orbital speed
+    // by construction.  Measured on the inner disk with a full-frame shutter:
+    // 20% of the mottling contrast smeared away and 26% off the frame-to-frame
+    // jump, against 2.4% over the disk as a whole -- which is the right shape,
+    // since the outer disk has nothing that needs blurring.  It damps the
+    // aliasing rather than abolishing it; --hero-shutter 2 roughly doubles the
+    // effect if the inner edge still crawls, and 0 freezes each frame so the
+    // difference can be seen.
+    static constexpr Real heroRate = 72.0;   // M of coordinate time per second
+    Real   heroSpan = 0;         // >0 overrides heroRate * heroSeconds
     double heroNoise = 1.0;      // target output noise per hero frame, in LSB
+    double heroShutter = 1.0;    // exposure as a fraction of the frame interval
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     bool   autoRays  = false;   // scripted: open the ray view straight away
@@ -1069,6 +1108,7 @@ int main(int argc, char** argv) {
         else if (a == "--hero-spp")     heroSpp = nextI();
         else if (a == "--hero-span")    heroSpan = nextF();
         else if (a == "--hero-noise")   heroNoise = nextF();
+        else if (a == "--hero-shutter") heroShutter = nextF();
         else if (a == "--autobake")   autoBake = nextI();
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
@@ -1088,7 +1128,11 @@ int main(int argc, char** argv) {
 "  --autorays             open the 3D ray view at startup\n"
 "  --autohero SIZE        render the hero shot and exit; SIZE is\n"
 "                         4k, 720p, vga or half-vga\n"
-"  --hero-seconds F --hero-spp N --hero-span M --hero-noise LSB\n"
+"  --hero-seconds F --hero-spp N --hero-noise LSB\n"
+"  --hero-shutter F       exposure as a fraction of the frame\n"
+"                         interval; 0 freezes each frame       (1.0)\n"
+"  --hero-span M          coordinate time over the whole shot; the\n"
+"                         default keeps the disk at 16 M per second\n"
 "  --video F --no-video --crf N    bake output; .mp4/.mkv encode H.265\n");
             printControls();
             return 0;
@@ -1225,6 +1269,7 @@ int main(int argc, char** argv) {
         }
         reconfigure(S, [&] {
             S.adaptive = false;            // live viewing refines indefinitely
+            S.shutter = 0;                    // live mode has no frame interval
             S.rt.winW = hero.saveW; S.rt.winH = hero.saveH; S.rt.scale = hero.saveScale;
             S.display.assign(size_t(hero.saveW) * hero.saveH * 3, 0u);
             S.present = S.display;
@@ -1268,7 +1313,7 @@ int main(int argc, char** argv) {
         hero.fps = 24.0;
         hero.frames = std::max(2, int(heroSeconds * hero.fps + 0.5));
         hero.spp = std::max(1, heroSpp);
-        hero.tSpan = heroSpan;
+        hero.tSpan = heroSpan > 0 ? heroSpan : Real(heroRate * heroSeconds);
         hero.t0 = tWanted;
         hero.path = std::string("kerr-hero-") + label + ".mp4";
         hero.saveW = S.rt.winW; hero.saveH = S.rt.winH; hero.saveScale = S.rt.scale;
@@ -1285,9 +1330,17 @@ int main(int argc, char** argv) {
 
         double rays = double(hw) * hh * hero.spp * hero.frames;
         double est  = rays / std::max(1.0e5, raysPerSec);
+        // Turns the outer rim and the ISCO make over the shot, which is what
+        // the span actually means to anyone watching it.
+        double omOut  = 1.0 / (std::pow(double(sc.disk.rOut), 1.5) + double(sc.kerr.a));
+        double omIsco = 1.0 / (std::pow(double(sc.disk.rIn),  1.5) + double(sc.kerr.a));
         std::printf("\n  hero: %dx%d, %d frames at %.0f fps (%.0f s of footage), %d spp ceiling\n"
+                    "        disk turns %.1f M/s -- %.1f turns at the rim, %.0f at the inner edge\n"
                     "        adaptive to %.2f LSB; at most %.1f Gray, under %.1f h -- ESC to abandon\n",
                     hw, hh, hero.frames, hero.fps, hero.frames / hero.fps, hero.spp,
+                    double(hero.tSpan) / (hero.frames / hero.fps),
+                    double(hero.tSpan) * omOut / (2 * PI),
+                    double(hero.tSpan) * omIsco / (2 * PI),
                     heroNoise, rays / 1e9, est / 3600.0);
         std::fflush(stdout);
 
@@ -1300,6 +1353,10 @@ int main(int argc, char** argv) {
             S.cam        = camWanted;
             S.cam.aspect = Real(hw) / hh;
             S.tObs       = tWanted;
+            // A full-frame exposure: the samples of one pixel spread over the
+            // coordinate time between this frame and the next, so the disk's
+            // rotation is integrated rather than sampled at one instant.
+            S.shutter    = Real(heroShutter) * hero.tSpan / hero.frames;
             S.scene.disk.loopPeriod = 0;   // no loop trick: the disk simply turns
             S.passLimit.store(0, std::memory_order_relaxed);   // converge, uncapped
             S.adaptive    = heroNoise > 0; // 0 falls back to a flat --hero-spp

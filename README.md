@@ -159,6 +159,65 @@ disk turns by plain advection for the whole minute: the cross-fade that
 [closes a loop](#making-the-loop-close) is *not* applied, because this shot does
 not loop and has no seam to hide.
 
+#### How fast the disk turns, and the shutter that makes it possible
+
+The disk advances **72 M of coordinate time per second of footage**, which turns
+its inner edge three times a second. That is a rate, not a total: `--hero-span`
+sets the whole shot's span if you want one, but by default a short test render
+turns at the same speed as the full minute instead of sprinting through a fixed
+span in fewer frames. What the rate means at each radius:
+
+| radius | orbital period | turns per second of footage |
+|---|--:|--:|
+| 2.02 M (ISCO) | 24 M | 3.0 |
+| 6 M (peak flux) | 98 M | 0.73 |
+| 18 M (outer rim) | 486 M | 0.15 |
+
+At 24 fps that is 3 M per frame, and there the trouble starts. The cosmetic
+mottling's dominant octave has 16 features around the disk, one every 22.5°,
+while the inner edge sweeps 45° between frames — two features per frame, which
+samples as a strobe rather than as rotation. The onset is measurable: the
+frame-to-frame image difference grows linearly with the time step, as properly
+sampled motion must, up to about 1.5 M per frame, and goes plainly sub-linear
+past it.
+
+Only the inside is affected. The time for one feature to pass runs from 1.5 M at
+the ISCO to 30 M at the rim, so everything outside about r = 6 M is sampled
+perfectly well at any rate this shot uses:
+
+| radius | one feature passes in | features per frame |
+|---|--:|--:|
+| 2.02 M | 1.5 M | 2.00 — aliased |
+| 4 M | 3.5 M | 0.85 — aliased |
+| 6 M | 6.1 M | 0.49 — at Nyquist |
+| 12 M | 16.7 M | 0.18 — fine |
+| 18 M | 30.4 M | 0.10 — fine |
+
+The fix is a shutter. Each frame spreads the samples of a pixel across its
+exposure rather than taking them all at one instant, so the rotation is
+integrated into blur — and because the blur is the disk's own motion, it scales
+with the local orbital speed for free. It is very nearly free in time as well:
+those samples were already being traced, they just carry different emission
+times now, and a hero clip renders in 127 s against 126 s frozen, needing 177
+samples per pixel against 174. Measured on the inner disk with a full-frame
+exposure, against the same shot frozen:
+
+| shutter | mottling contrast | frame-to-frame jump |
+|---|--:|--:|
+| 0 (frozen) | 100% | 0.113 |
+| 0.5 | 92% | — |
+| **1.0 (default)** | **80%** | **0.083** |
+| 2.0 | 53% | — |
+
+Over the disk as a whole a full-frame shutter removes only 2.4% of the
+mottling, which is the right shape rather than a disappointment: the outer disk
+has nothing that needs blurring. It damps the aliasing rather than abolishing
+it. `--hero-shutter 2` roughly doubles the effect if the inner edge still
+crawls, `--hero-shutter 0` freezes each frame so you can see what it is doing,
+and `--hero-span` slows the whole thing down if you would rather not blur at
+all. The batch renderer has the same control as `--shutter`, applied to any
+`--frames` sequence; a single still ignores it.
+
 Frames are streamed to the encoder as they converge rather than kept. That is
 not an optimisation: a minute of 4K is 1440 frames of 24 MB, and holding them
 the way a bake does would want 35 GB. One frame is in memory at a time.
@@ -1529,7 +1588,8 @@ Image     --width --height --noise --spp --min-spp --max-spp --bounces
           --threads --seed --out --pfm
 Hole/cam  --spin --dist --inc --cam-phi --fov --yaw --pitch
 Disk      --rin --rout --tpeak --albedo --turbulence --edge --tau
-Animation --time --frames --orbits --tstep --loop --video --fps --no-png
+Animation --time --shutter --frames --orbits --tstep --loop --video --fps
+          --no-png
 Sky       --sky-gain --star-density --band --nostars
 Tone map  --exposure --key --bloom --desat
 Accuracy  --rtol --max-steps --no-simd

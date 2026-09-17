@@ -306,12 +306,17 @@ inline void runPacket(const Kerr& kerr, const Disk& disk, const Propagator& prop
 // Propagation is vectorised; what happens at a surface is not.  Disk emission
 // and scattering are branchy, per-lane and comparatively rare, so they stay
 // scalar and reuse the same expressions as the scalar tracer.
+//
+// tObs is per lane rather than per packet so that samples of one pixel can be
+// spread across the frame's exposure: the disk turns while the shutter is open,
+// and without that a fast-turning disk aliases into a strobe instead of
+// blurring.  A still or a frozen frame passes the same value in every lane.
 inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
                         const Propagator& prop, Geodesic g[LANES],
                         const Real lambda0[LANES][spec::NLAMBDA], Rng rng[LANES],
                         int maxBounces, int nActive,
                         Real radianceOut[LANES][spec::NLAMBDA],
-                        Real tObs = 0, uint64_t* steps = nullptr)
+                        const Real tObs[LANES], uint64_t* steps = nullptr)
 {
     Real travel[LANES] = {};      // light travel time back from the camera
     Real shift[LANES], throughput[LANES];
@@ -359,7 +364,7 @@ inline void tracePacket(const Kerr& kerr, const Disk& disk, const Sky& sky,
             Real pth = res.yEnd[i].y[4];
 
             travel[i] += res.yEnd[i].y[5];
-            Real tEmit = tObs - travel[i];
+            Real tEmit = tObs[i] - travel[i];
 
             Vec4 u  = disk.orbitVelocity(r);
             Real om = disk.orbitOmega(r);
