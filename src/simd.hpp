@@ -20,26 +20,30 @@
 #endif
 
 // Lane count is a build-time knob because the right width is a measurement,
-// not a given: see the ISA table in the README.  The defaults below are that
-// measurement, and they are not what intuition suggests -- wider is better than
-// the divergence argument predicts, because the extra independent work hides
-// latency that idle lanes would otherwise expose.  Measured on this tracer at
-// 640x360:
+// not a given: see the ISA table in the README.  Eight is one full 512-bit
+// register, and on anything with AVX2 or better that is where it belongs.
+// Sixteen was the default for a while, on the strength of a 4 to 10% gain, but
+// that gain came from the far field -- long, straight, perfectly coherent runs
+// where idle lanes were rare -- and the step controller no longer spends a
+// third of its budget out there.  Measured at 640x360 after that fix:
 //
-//   AVX-512   8 lanes 10.63    16 lanes 11.10 Mrays/s   +4.5%
-//   AVX2      8 lanes  9.33    16 lanes 10.29 Mrays/s   +10%
-//   SSE2      8 lanes  3.33     4 lanes  3.56 Mrays/s   +7%
+//   AVX-512   8 lanes 15.12    16 lanes 15.06 Mrays/s   -0.4%
+//   AVX2      8 lanes 15.14    16 lanes 15.17 Mrays/s   +0.2%
+//   SSE2      8 lanes  4.71     4 lanes  5.09 Mrays/s   +8%
+//
+// So sixteen now buys nothing in the batch renderer, and it still costs the
+// viewer 6% because that front end packs adjacent pixels rather than repeated
+// samples of one pixel, and adjacent pixels diverge.  Eight everywhere, four
+// where the registers are only 128 bits wide.
 //
 // The lane count never changes what is computed, only how it is grouped: a
 // sample's ray depends on its index alone, so every width renders the same
 // image bit for bit.
 #ifndef KERR_LANES
-#  if defined(__AVX2__) || defined(__AVX512F__)
-#    define KERR_LANES 16
-#  elif defined(__SSE2__)
+#  if defined(__SSE2__) && !defined(__AVX2__) && !defined(__AVX512F__)
 #    define KERR_LANES 4
 #  else
-#    define KERR_LANES 8          // untested elsewhere; the long-standing default
+#    define KERR_LANES 8
 #  endif
 #endif
 static constexpr int LANES = KERR_LANES;

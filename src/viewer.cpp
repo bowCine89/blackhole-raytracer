@@ -3,10 +3,10 @@
 // The path tracer in render.hpp is the backend, unchanged: this file only
 // decides *which* rays to trace and when to show the result.
 //
-// The whole design follows from one number.  At roughly 2.9 Mrays/s a 33 ms
-// frame buys about 96k samples, while a 1280x720 window has 921k pixels.  Full
-// resolution therefore cannot deliver even a tenth of a sample per pixel inside
-// an interactive frame, so the viewer runs in two regimes:
+// The whole design follows from one number.  At 12.8 Mrays/s a 33 ms frame buys
+// about 420k samples, while a 1280x720 window has 921k pixels.  Full resolution
+// therefore cannot deliver even half a sample per pixel inside an interactive
+// frame, so the viewer runs in two regimes:
 //
 //   moving  -- render at reduced resolution, one sample per pixel, each pixel
 //              painted as a scale x scale block.  The scale is derived from
@@ -22,13 +22,11 @@
 // and no per-tile generation tracking is needed.
 // The viewer packs a packet from *adjacent pixels*; the batch renderer packs one
 // from repeated samples of a single pixel.  Those are not equally coherent --
-// adjacent pixels are different rays and diverge -- so the wider grouping that
-// buys main.cpp 4 to 10% costs the viewer 2 to 6%: measured 9.95 against 9.30
-// Mrays/s at 800x500, and 8.29 against 8.10 at 200x120.  The width belongs with
-// the packing strategy, so the viewer keeps eight.
-#ifndef KERR_LANES
-#  define KERR_LANES 8
-#endif
+// adjacent pixels are different rays and diverge -- so a wider packet hurts
+// here even where it is neutral there: sixteen lanes measures 11.77 against
+// eight lanes' 12.56 Mrays/s at 800x500.  Eight is simd.hpp's default, so this
+// file no longer pins it; if the default ever moves, this is the measurement
+// that argues against following it.
 
 #include "core.hpp"
 #include "kerr.hpp"

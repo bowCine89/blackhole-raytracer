@@ -302,10 +302,10 @@ coordinate time between frames, and the frame cap (180 frames is about 500 MB at
 
 ### Why it has two regimes
 
-One number forces the whole design. Even at 12 Mrays/s a 33 ms frame buys about
-**400k samples**, while a 1280×720 window has **921k pixels**. Full resolution
-still cannot deliver one sample per pixel inside an interactive frame, so the
-viewer switches between:
+One number forces the whole design. Even at 12.8 Mrays/s a 33 ms frame buys
+about **420k samples**, while a 1280×720 window has **921k pixels**. Full
+resolution still cannot deliver one sample per pixel inside an interactive
+frame, so the viewer switches between:
 
 | | resolution | samples | what you see |
 |---|---|---|---|
@@ -365,12 +365,13 @@ carries **four** wavelengths, stratified across the band:
 
 | | chromatic noise | throughput |
 |---|--:|--:|
-| 1 wavelength per path | 0.309 | 10.8 Mrays/s |
-| 4 wavelengths per path | **0.139** | 9.35 Mrays/s |
+| 1 wavelength per path | 0.309 | 16.12 Mrays/s |
+| 4 wavelengths per path | **0.139** | 12.83 Mrays/s |
 
 Measured as the mean chromaticity difference between two seeds at 16 spp: a
 **2.2× reduction**, against the $\sqrt{4} = 2$ the sample count alone would
-predict, for **13%** throughput. The batch renderer gets the same benefit.
+predict, for **20%** throughput. The batch renderer gets the same benefit, and
+pays the same 20%.
 
 **Every displayed frame has to be uniform.** Publishing whatever the workers had
 painted showed a mix of two passes — rectangular patches where some tiles had
@@ -385,9 +386,9 @@ shown again, so convergence stays visible.
 **The present loop must not block on vsync.** A capped pass can finish part way
 through a display interval, and if publication waits for the next vsync every
 worker idles until then: measured at **a third** of total throughput, which the
-adaptive scale then pays for in resolution. Polling fast and presenting on a
-timer recovers it — 6.15 to **7.7 Mrays/s** while the camera is moving, at
-640x360 instead of 427x240.
+adaptive scale then pays for in resolution — 427×240 instead of 640×360 while
+the camera moves. Polling fast and presenting on a timer recovers it; the
+moving regime now settles at **10.3 Mrays/s at 640×360**.
 
 ### Exposure
 
@@ -1051,12 +1052,12 @@ alone costs $\sim 10^{-10}$ of that per evaluation.
 
 16-core / 32-thread Zen 5 (Ryzen 9 9950X), 640×360 at 32 spp, default settings.
 
-**9.4 Mrays/s**, from 1.03 where this started — and each ray now carries four
-wavelengths rather than one, so the spectral sample rate is ~37 M/s. The
-1920×1080 hero image at 384 spp takes about 70 s, down from 266 s.
+**12.1 Mrays/s**, from 1.03 where this started — and each ray now carries four
+wavelengths rather than one, so the spectral sample rate is ~48 M/s. The
+1920×1080 hero image at 384 spp takes **56 s**, down from 266 s.
 
 The per-ray figures below were measured with one wavelength per path; carrying
-four costs a further 13%, bought back several times over in noise.
+four costs a further 20%, bought back several times over in noise.
 
 ### Packet tracing: eight rays per lane
 
@@ -1069,17 +1070,17 @@ unrelated.
 
 | | Mrays/s | steps/ray | speedup |
 |---|--:|--:|--:|
-| scalar | 2.95 | 60 | 1.0× |
-| 2 lanes | 4.96 | 66 | 1.7× |
-| 4 lanes | 8.04 | 72 | 2.7× |
-| **8 lanes** | **11.41** | 78 | **3.9×** |
+| scalar | 3.39 | 45 | 1.0× |
+| 2 lanes | 6.08 | 50 | 1.8× |
+| 4 lanes | 10.11 | 54 | 3.0× |
+| **8 lanes** | **15.05** | 58 | **4.4×** |
 
-Per-step throughput went from 179 to 1078 Msteps/s — **6.0×**, against a
+Per-step throughput went from 153 to 874 Msteps/s — **5.7×**, against a
 theoretical ceiling of 8. It is tempting to read the 60 → 78 steps/ray column as
 the explanation, and an earlier version of this file did. That is wrong, and the
 error is worth naming: `Msteps/s` counts *issued* lane-steps, idle lanes
 included, so divergence cannot be what holds that figure below 8. Divergence is
-charged separately — it is what turns the 6.0× per-step number into the 3.9×
+charged separately — it is what turns the 5.7× per-step number into the 4.4×
 per-ray one.
 
 What holds the per-step figure down is the packet code itself: it is heavier per
@@ -1112,46 +1113,70 @@ was predicted:
 
 | build | scalar | 8-wide packet |
 |---|--:|--:|
-| SSE2 only (`-mno-avx -mno-fma`) | 2.54 | 4.05 |
-| AVX2 (`-mno-avx512f`) | 2.93 | 11.33 |
-| AVX-512 (`-march=native`) | 2.83 | 11.41 |
+| SSE2 only (`-mno-avx -mno-fma`) | 2.91 | 4.71 |
+| AVX2 (`-mno-avx512f`) | 3.39 | 15.10 |
+| AVX-512 (`-march=native`) | 3.22 | 15.04 |
 
-Vectorising was worth **2.8×** (SSE2 → AVX2). **AVX-512 specifically adds
-~1%**, inside the noise. Eight lanes still beat four, but on AVX2 that is two
-256-bit registers in flight rather than one 512-bit one — so the win is having
-eight rays in flight, not the wider register. The prediction that this needed
-AVX-512 was wrong; it needed *vectorisation*, and 256-bit hardware captures
-essentially all of it.
+Vectorising was worth **3.2×** (SSE2 → AVX2). **AVX-512 adds nothing at all**
+— 15.04 against 15.10 is a rounding error the wrong way. Eight lanes still beat
+four, but on AVX2 that is two 256-bit registers in flight rather than one
+512-bit one — so the win is having eight rays in flight, not the wider
+register. The prediction that this needed AVX-512 was wrong; it needed
+*vectorisation*, and 256-bit hardware captures all of it.
 
-### How many lanes, and why it differs by front end
+### How many lanes, and why sixteen stopped paying
 
-Eight was the default at every width. Measuring it again, on this machine at
-640×360, it is not the best one anywhere:
+For a while the default was sixteen, on the strength of a 4 to 10% gain over
+eight. That gain is gone, and the reason is instructive. Measured again at
+640×360:
 
 | ISA | 4 lanes | 8 lanes | 16 lanes |
 |---|--:|--:|--:|
-| AVX-512 | — | 10.63 | **11.10** |
-| AVX2 | — | 9.33 | **10.29** |
-| SSE2 | **3.56** | 3.33 | 2.87 |
+| AVX-512 | 10.08 | **15.12** | 15.06 |
+| AVX2 | 10.11 | **15.14** | 15.17 |
+| SSE2 | **5.09** | 4.71 | 4.08 |
 
-Wider wins by more than the divergence argument allows for, but not for the
-reason that suggests: sixteen lanes is no longer *width* at all, since a
-512-bit register already holds eight doubles. It is two registers per value, and
-what it buys is a better-scheduled instruction stream — worth about 20%, and
-the last such gain on offer, as the next section shows. Note also that AVX2 at
-sixteen lanes (10.29) all but catches AVX-512 (11.10) — the width of the
-register continues to matter much less than having the rays.
+Sixteen lanes is not *width* — a 512-bit register already holds eight doubles,
+so sixteen is two registers per value and buys only a better-scheduled
+instruction stream. It still buys that: per *thread* it is reliably ahead. What
+it no longer buys is throughput on a machine that is already full.
+
+| threads | 8 lanes | 16 lanes | |
+|--:|--:|--:|--:|
+| 1 | 0.75 | 0.83 | +10.7% |
+| 4 | 2.92 | 3.23 | +10.6% |
+| 8 | 5.57 | 6.12 | +9.9% |
+| 16 | 8.73 | 10.18 | +16.6% |
+| 24 | 10.17 | 12.18 | +19.8% |
+| **32** | **12.13** | **12.18** | **+0.4%** |
+
+Both widths converge on the same ceiling, about 12.15 Mrays/s. Sixteen lanes
+reaches it at 24 threads and has nothing left to give; eight needs all 32 and
+gets there too. The renderer always runs every thread, so in the only
+configuration that ships the width makes no difference — while the wider packet
+carries a `runPacket` stack frame of 21.5 KB against 8 KB, which is a poor
+trade for nothing. (What that shared ceiling *is* was not isolated; this
+machine's CPU topology is virtualised, so core placement could not be
+controlled well enough to test it.)
+
+Sixteen was worth 4 to 10% here before the step controller was fixed, on rays
+that spent a third of their steps in the far field — long, straight, perfectly
+coherent runs where every lane stayed alive. Deleting those steps took the
+conditions sixteen lanes needed with them.
+
+It never helped the viewer at all. `main.cpp` packs a packet from repeated
+samples of **one pixel** — same geometry, maximal coherence. `viewer.cpp` packs
+one from **adjacent pixels**, which are different rays that diverge, and there
+sixteen lanes costs **6%**: 11.77 against eight lanes' 12.56 Mrays/s at
+800×500. So the default is now eight everywhere, and four where the registers
+are only 128 bits wide.
+
+Note also that AVX2 (15.14) and AVX-512 (15.12) are indistinguishable — the
+width of the register continues to matter much less than having the rays.
 
 The lane count never changes what is computed, only how it is grouped: a
 sample's ray depends on its index alone, so every width renders the same image
 bit for bit. That was verified, not assumed.
-
-The surprise is that the two front ends want different answers. `main.cpp` packs
-a packet from repeated samples of **one pixel** — same geometry, maximal
-coherence — and gains 4 to 10% from sixteen. `viewer.cpp` packs one from
-**adjacent pixels**, which are different rays that diverge, and *loses* 2 to 6%:
-9.95 against 9.30 Mrays/s at 800×500. So the width is chosen where the packing
-is chosen, and the viewer keeps eight.
 
 ### Where the width actually goes
 
@@ -1166,16 +1191,16 @@ they are not the same thing.
 
 | lanes | Mrays/s | steps/ray | Mlane-step/s | per step | per ray |
 |---|--:|--:|--:|--:|--:|
-| `--no-simd` | 0.12 | 64 | 7.9 | 1.0× | 1.0× |
-| 1 | 0.11 | 65 | 6.9 | 0.9× | 0.9× |
-| 2 | 0.23 | 71 | 16.3 | 2.1× | 1.9× |
-| 4 | 0.37 | 77 | 28.9 | 3.7× | 3.1× |
-| 8 | 0.57 | 84 | 47.5 | 6.0× | 4.8× |
-| **16** | **0.67** | 89 | **59.1** | **7.5×** | **5.6×** |
-| 24 | 0.31 | 131 | 41.0 | 5.2× | 2.6× |
-| 32 | 0.64 | 93 | 59.2 | 7.5× | 5.3× |
+| `--no-simd` | 0.17 | 45 | 7.5 | 1.0× | 1.0× |
+| 1 | 0.14 | 46 | 6.7 | 0.9× | 0.8× |
+| 2 | 0.31 | 50 | 15.3 | 2.0× | 1.8× |
+| 4 | 0.48 | 54 | 25.9 | 3.5× | 2.8× |
+| 8 | 0.73 | 59 | 42.7 | 5.7× | 4.3× |
+| **16** | **0.81** | 62 | **50.4** | **6.7×** | **4.8×** |
+| 24 | 0.40 | 92 | 37.2 | 5.0× | 2.4× |
+| 32 | 0.81 | 66 | 53.2 | 7.1× | 4.8× |
 
-Note first that one lane is *slower* than `--no-simd`. That 13% is the price of
+Note first that one lane is *slower* than `--no-simd`. That 11% is the price of
 the packet machinery itself — masked arithmetic, no early exit, both branches of
 every decision evaluated. It is charged before a single extra lane is filled.
 
@@ -1191,22 +1216,22 @@ This is the dominant effect and it is almost embarrassingly simple. `vd` is a
 | lanes | `sizeof(vd)` | register | insns per DP trial | insns per lane-step | cycles per lane-step |
 |---|--:|:--|--:|--:|--:|
 | 1 | 8 B | scalar `sd` | 810 | 810 | 474.8 |
-| 2 | 16 B | `xmm` | 882 | 441 | 190.2 |
-| 4 | 32 B | `ymm` | 832 | 208 | 97.6 |
-| 8 | 64 B | `zmm` | 827 | 103.4 | 50.5 |
-| 16 | 128 B | 2 × `zmm` | 1586 | 99.1 | 41.9 |
-| 32 | 256 B | 4 × `zmm` | 2899 | 90.6 | 42.0 |
+| 2 | 16 B | `xmm` | 882 | 441 | 187.4 |
+| 4 | 32 B | `ymm` | 832 | 208 | 96.5 |
+| 8 | 64 B | `zmm` | 827 | 103.4 | 50.2 |
+| 16 | 128 B | 2 × `zmm` | 1586 | 99.1 | 41.8 |
+| 32 | 256 B | 4 × `zmm` | 2899 | 90.6 | 42.1 |
 
 Up to eight lanes, `PacketDP::trial` compiles to *the same instruction stream* —
 827 to 882 instructions, whatever the width. Only the register changes. Each
 doubling is therefore free, and instructions per lane-step halve: 810, 441, 208,
-103. Cycles per lane-step follow: 474.8, 190.2, 97.6, 50.5.
+103. Cycles per lane-step follow: 474.8, 187.4, 96.5, 50.2.
 
 At sixteen lanes a `vd` no longer fits in a register, so every `vd` operation
 becomes two `zmm` operations and the instruction count nearly doubles, 827 →
 1586. At thirty-two it quadruples. Instructions per lane-step stops falling —
-103, 99, 91 — and so does the thing that matters, cycles per lane-step: **50.5,
-41.9, 42.0**. That flat tail is the whole non-linearity. There is no wider
+103, 99, 91 — and so does the thing that matters, cycles per lane-step: **50.2,
+41.8, 42.1**. That flat tail is the whole non-linearity. There is no wider
 register to move up to, so the last two doublings cost what they deliver.
 
 #### Past eight, there is nothing left to feed the core
@@ -1218,19 +1243,19 @@ trials interleaved in one loop:
 
 | lanes | K=1 → K=3 |
 |---|--:|
-| 2 | **+15%** |
-| 4 | +4% |
-| 8 | +3.5% |
-| 16 | 0% |
-| 32 | −3% |
+| 2 | +4.1% |
+| 4 | +5.2% |
+| 8 | +4.1% |
+| 16 | +0.9% |
+| 32 | −0.7% |
 
-At two lanes the kernel is latency-bound and extra work plainly helps. By eight
-it barely does; at sixteen and beyond it does nothing. Both routes to more
-parallelism — wider vectors and more packets — run into the same 32-register
-budget, and both stop paying at the same place. It is the register file that
-caps this kernel, not the FMA pipes: at sixteen lanes the trial issues 658
-FMA+MUL in 672 cycles, **49% of the two pipes**, with the other half spent
-elsewhere.
+Up to eight lanes there are a few percent to be had, so a little latency is
+still exposed. At sixteen and beyond there is none — the extra work has nowhere
+to go. Both routes to more parallelism — wider vectors and more packets — run
+into the same 32-register budget, and both stop paying at the same place. It is
+the register file that caps this kernel, not the FMA pipes: at sixteen lanes the
+trial issues 658 FMA+MUL in 666 cycles, **49% of the two pipes**, with the other
+half spent elsewhere.
 
 #### At thirty-two, register pressure takes the gain back
 
@@ -1253,13 +1278,13 @@ counted directly rather than inferred:
 
 | lanes | primary rays only | with 2 bounces | segment occupancy |
 |---|--:|--:|--:|
-| 2 | 99.3% | 92.5% | 94.6% |
-| 4 | 97.9% | 84.4% | 89.1% |
-| 8 | 95.7% | 75.9% | 83.6% |
-| 16 | 91.4% | 68.9% | 80.4% |
-| 32 | 84.1% | 61.3% | 77.9% |
+| 2 | 99.1% | 93.0% | 94.6% |
+| 4 | 97.6% | 85.2% | 89.1% |
+| 8 | 95.0% | 76.4% | 83.6% |
+| 16 | 90.1% | 68.8% | 80.4% |
+| 32 | 82.0% | 60.2% | 77.9% |
 
-Divergence *within* a packet of primary rays costs 4 to 9% at the widths anyone
+Divergence *within* a packet of primary rays costs 5 to 10% at the widths anyone
 would ship — small, and exactly what the coherence argument predicts. The much
 larger loss appears only once the disk is scattering, and it is not really
 divergence at all: it is **segment restart**. When a lane scatters off the disk,
@@ -1269,15 +1294,15 @@ column, and it is the one worth attacking.
 
 The two factors compose, and the first table is enough to check it: per-step
 speedup × occupancy should give per-ray speedup, where occupancy is the
-`--no-simd` steps/ray over this width's. At eight lanes, 6.0 × (64/84) = 4.6
-against 4.8 measured; at sixteen, 7.5 × (64/89) = 5.4 against 5.6. The few
-percent is the integer rounding on the steps/ray column.
+`--no-simd` steps/ray over this width's. At eight lanes, 5.7 × (45/59) = 4.3
+against 4.3 measured; at sixteen, 6.7 × (45/62) = 4.9 against 4.8. The last
+digit is the integer rounding on the steps/ray column.
 
 #### Twenty-four lanes is the price list, made visible
 
 `sizeof(vd)` for 24 lanes rounds up to **256 bytes — four `zmm` registers,
 exactly what 32 lanes costs** — to carry three quarters of the work. It measures
-0.31 Mrays/s against 32's 0.64. It is not a point on the curve so much as a
+0.40 Mrays/s against 32's 0.81. It is not a point on the curve so much as a
 demonstration of how the curve is priced, which is why the ISA table above only
 offers powers of two.
 
@@ -1292,8 +1317,8 @@ offers powers of two.
 
 ### The step controller was fighting itself
 
-Every figure in this chapter up to here predates this section; the tracer is
-about 1.25× faster than they say.
+The single largest win since packet tracing, and it came from a constant that
+was simply set wrong.
 
 Dormand–Prince sizes step *n+1* from the error of step *n*. That is pure
 feedback, and it assumes the local error coefficient has not moved in between.
@@ -1387,12 +1412,12 @@ Also tried and rejected:
 
 | threads | time | Mrays/s |
 |--------:|-----:|--------:|
-| 1 | 10.8 s | 0.68 |
-| 4 | 2.8 s | 2.61 |
-| 16 | 0.90 s | 8.21 |
-| 31 | 0.65 s | 11.31 |
+| 1 | 9.85 s | 0.75 |
+| 4 | 2.53 s | 2.92 |
+| 16 | 0.84 s | 8.73 |
+| 31 | 0.61 s | 12.11 |
 
-**16.6× on 16 cores + SMT.** Work is handed out as 16×16 tiles from an atomic
+**16.1× on 16 cores + SMT.** Work is handed out as 16×16 tiles from an atomic
 counter, so the expensive pixels — rays that wind near the photon ring — do not
 stall a whole row.
 
