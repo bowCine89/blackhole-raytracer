@@ -130,14 +130,18 @@ wheel         dolly in/out                           - / =   exposure
 ctrl+wheel    field of view                          b       scattering bounces
 r             reset camera                           s       save PNG(s)
 g             3D ray view (see below)                q       quit
-h / p / v     hero shot, 4K / 720p / VGA
+h/p/v/n       hero shot, 4K / 720p / VGA / half-VGA
 ```
 
 ### The hero shot
 
 `h` renders a scripted camera move at 4K and streams it to
-`kerr-hero-4k.mp4`; `p` and `v` do the same at 720p and VGA, into
-`kerr-hero-720p.mp4` and `kerr-hero-vga.mp4`. The move
+`kerr-hero-4k.mp4`; `p`, `v` and `n` do the same at 720p, VGA (640×480) and
+half-VGA (320×240), into `kerr-hero-720p.mp4`, `kerr-hero-vga.mp4` and
+`kerr-hero-half-vga.mp4`. Half-VGA is VGA halved on each axis, so the two frame
+identically; note that both are 4:3 and therefore show a *narrower* horizontal
+field than the 16:9 4K and 720p, since `--fov` fixes the vertical angle and the
+aspect ratio sets the horizontal one. The move
 opens wide and below the disk plane, framed on the approaching side — which is
 the bright one, by about a factor of four at this inclination — then pushes in
 and rises through the plane, settling centred on the shadow.
@@ -191,9 +195,13 @@ neighbours tracing.
 so a minute of footage is the better part of two days; the estimate is printed
 before the first frame so `ESC` can end it cheaply. `--hero-seconds`,
 `--hero-spp` and `--hero-span` trade that down. `p` at 720p costs about a ninth
-of 4K and `v` at VGA about a fortieth, which is the sane way to check the move
-before committing to it. `--autohero 4k|720p|vga` renders without a keypress
-and exits.
+of 4K and `v` at VGA about a fortieth. `n` at half-VGA costs a **third of VGA**
+— measured, 117 s against 369 s for the same four seconds of footage, rather
+than the quarter the pixel count suggests, because the adaptive sampler still
+has to drive every remaining pixel to the same noise floor. That puts a full
+minute of half-VGA at about **29 minutes**, which is the sane way to check the
+move before committing to it. `--autohero 4k|720p|vga|half-vga` renders without
+a keypress and exits.
 
 ### Seeing the rays
 

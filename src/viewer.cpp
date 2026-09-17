@@ -990,7 +990,8 @@ static void printControls() {
 "  - / =                exposure\n"
 "  b                    cycle scattering bounces (0-4)\n"
 "  g                    3D ray view: see the geodesics this camera casts\n"
-"  h / p / v            hero shot, 4K / 720p / VGA -> kerr-hero-*.mp4\n"
+"  h / p / v / n        hero shot, 4K / 720p / VGA / half-VGA\n"
+"                       -> kerr-hero-*.mp4\n"
 "  r                    reset the camera\n"
 "  s                    save a PNG snapshot\n"
 "  q                    quit\n"
@@ -1028,7 +1029,7 @@ int main(int argc, char** argv) {
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     bool   autoRays  = false;   // scripted: open the ray view straight away
-    std::string autoHero;       // scripted: "4k" or "vga", render and quit
+    std::string autoHero;       // scripted size name, render and quit
     int    autoBake = 0;        // scripted: bake N frames, play, then quit
     double userExposure = 1.0, key = 1.3;
     int threads = 0;
@@ -1085,7 +1086,8 @@ int main(int argc, char** argv) {
 "  --bounces N --sky-gain F --nostars\n"
 "  --exposure F --fps F --threads N --rtol F\n"
 "  --autorays             open the 3D ray view at startup\n"
-"  --autohero 4k|720p|vga render the hero shot and exit\n"
+"  --autohero SIZE        render the hero shot and exit; SIZE is\n"
+"                         4k, 720p, vga or half-vga\n"
 "  --hero-seconds F --hero-spp N --hero-span M --hero-noise LSB\n"
 "  --video F --no-video --crf N    bake output; .mp4/.mkv encode H.265\n");
             printControls();
@@ -1411,9 +1413,21 @@ int main(int argc, char** argv) {
         // Scripted hero shot, so it can be rendered without a hand on the keyboard.
         if (!autoHero.empty() && mode == Mode::Live && !hero.active
             && since(startTime) > 0.4) {
-            if      (autoHero == "4k")   heroStart(3840, 2160, "4k");
-            else if (autoHero == "720p") heroStart(1280, 720,  "720p");
-            else                         heroStart(640,  480,  "vga");
+            if      (autoHero == "4k")       heroStart(3840, 2160, "4k");
+            else if (autoHero == "720p")     heroStart(1280, 720,  "720p");
+            else if (autoHero == "vga")      heroStart(640,  480,  "vga");
+            else if (autoHero == "half-vga") heroStart(320,  240,  "half-vga");
+            else {
+                // The old chain fell through to VGA for anything it did not
+                // recognise, which turns a typo into a long render at the
+                // wrong size.  Name every size, and say so when the name is
+                // not one of them.
+                std::printf("  --autohero: '%s' is not a size "
+                            "(4k, 720p, vga, half-vga); rendering VGA\n",
+                            autoHero.c_str());
+                std::fflush(stdout);
+                heroStart(640, 480, "vga");
+            }
             autoHero.clear();
         }
 
@@ -1609,6 +1623,7 @@ int main(int argc, char** argv) {
                 case SDLK_h: heroStart(3840, 2160, "4k");   break;
                 case SDLK_p: heroStart(1280, 720,  "720p"); break;
                 case SDLK_v: heroStart(640,  480,  "vga");  break;
+                case SDLK_n: heroStart(320,  240,  "half-vga"); break;
                 case SDLK_g:
                     if (mode == Mode::Live) {
                         // Capture with the workers parked: the scene is only
