@@ -1113,6 +1113,33 @@ eight rays in flight, not the wider register. The prediction that this needed
 AVX-512 was wrong; it needed *vectorisation*, and 256-bit hardware captures
 essentially all of it.
 
+### How many lanes, and why it differs by front end
+
+Eight was the default at every width. Measuring it again, on this machine at
+640×360, it is not the best one anywhere:
+
+| ISA | 4 lanes | 8 lanes | 16 lanes |
+|---|--:|--:|--:|
+| AVX-512 | — | 10.63 | **11.10** |
+| AVX2 | — | 9.33 | **10.29** |
+| SSE2 | **3.56** | 3.33 | 2.87 |
+
+Wider wins by more than the divergence argument allows for, because the extra
+independent work hides latency that idle lanes would otherwise expose. Note
+also that AVX2 at sixteen lanes (10.29) all but catches AVX-512 (11.10) — the
+width of the register continues to matter much less than having the rays.
+
+The lane count never changes what is computed, only how it is grouped: a
+sample's ray depends on its index alone, so every width renders the same image
+bit for bit. That was verified, not assumed.
+
+The surprise is that the two front ends want different answers. `main.cpp` packs
+a packet from repeated samples of **one pixel** — same geometry, maximal
+coherence — and gains 4 to 10% from sixteen. `viewer.cpp` packs one from
+**adjacent pixels**, which are different rays that diverge, and *loses* 2 to 6%:
+9.95 against 9.30 Mrays/s at 800×500. So the width is chosen where the packing
+is chosen, and the viewer keeps eight.
+
 ### Threads
 
 | threads | time | Mrays/s |

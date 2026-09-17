@@ -20,6 +20,16 @@
 // worker count to reach zero, mutates, then releases.  Because no worker can be
 // mid-tile at that moment, no stale sample is ever written into a fresh buffer
 // and no per-tile generation tracking is needed.
+// The viewer packs a packet from *adjacent pixels*; the batch renderer packs one
+// from repeated samples of a single pixel.  Those are not equally coherent --
+// adjacent pixels are different rays and diverge -- so the wider grouping that
+// buys main.cpp 4 to 10% costs the viewer 2 to 6%: measured 9.95 against 9.30
+// Mrays/s at 800x500, and 8.29 against 8.10 at 200x120.  The width belongs with
+// the packing strategy, so the viewer keeps eight.
+#ifndef KERR_LANES
+#  define KERR_LANES 8
+#endif
+
 #include "core.hpp"
 #include "kerr.hpp"
 #include "spectrum.hpp"

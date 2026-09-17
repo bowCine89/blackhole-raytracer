@@ -20,9 +20,27 @@
 #endif
 
 // Lane count is a build-time knob because the right width is a measurement,
-// not a given: see the ISA table in the README.
+// not a given: see the ISA table in the README.  The defaults below are that
+// measurement, and they are not what intuition suggests -- wider is better than
+// the divergence argument predicts, because the extra independent work hides
+// latency that idle lanes would otherwise expose.  Measured on this tracer at
+// 640x360:
+//
+//   AVX-512   8 lanes 10.63    16 lanes 11.10 Mrays/s   +4.5%
+//   AVX2      8 lanes  9.33    16 lanes 10.29 Mrays/s   +10%
+//   SSE2      8 lanes  3.33     4 lanes  3.56 Mrays/s   +7%
+//
+// The lane count never changes what is computed, only how it is grouped: a
+// sample's ray depends on its index alone, so every width renders the same
+// image bit for bit.
 #ifndef KERR_LANES
-#  define KERR_LANES 8
+#  if defined(__AVX2__) || defined(__AVX512F__)
+#    define KERR_LANES 16
+#  elif defined(__SSE2__)
+#    define KERR_LANES 4
+#  else
+#    define KERR_LANES 8          // untested elsewhere; the long-standing default
+#  endif
 #endif
 static constexpr int LANES = KERR_LANES;
 
