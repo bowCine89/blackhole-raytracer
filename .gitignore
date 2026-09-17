@@ -13,6 +13,9 @@
 kerrview-*.png
 *.avi
 !kerr-orbit.avi
+# H.265 output, from --video and from the hero shot
+*.mp4
+*.mkv
 *.log
 blackhole-*.png
 kerrbake-*.png

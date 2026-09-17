@@ -130,13 +130,14 @@ wheel         dolly in/out                           - / =   exposure
 ctrl+wheel    field of view                          b       scattering bounces
 r             reset camera                           s       save PNG(s)
 g             3D ray view (see below)                q       quit
-h / v         hero shot, 4K / VGA
+h / p / v     hero shot, 4K / 720p / VGA
 ```
 
 ### The hero shot
 
 `h` renders a scripted camera move at 4K and streams it to
-`kerr-hero-4k.mp4`; `v` does the same at VGA into `kerr-hero-vga.mp4`. The move
+`kerr-hero-4k.mp4`; `p` and `v` do the same at 720p and VGA, into
+`kerr-hero-720p.mp4` and `kerr-hero-vga.mp4`. The move
 opens wide and below the disk plane, framed on the approaching side — which is
 the bright one, by about a factor of four at this inclination — then pushes in
 and rises through the plane, settling centred on the shadow.
@@ -161,9 +162,10 @@ the way a bake does would want 35 GB. One frame is in memory at a time.
 **It is a long render.** 4K at 96 spp is about two minutes a frame on 32 cores,
 so a minute of footage is the better part of two days; the estimate is printed
 before the first frame so `ESC` can end it cheaply. `--hero-seconds`,
-`--hero-spp` and `--hero-span` trade that down, and `v` at VGA is roughly forty
-times cheaper for checking the move before committing to it. `--autohero 4k|vga`
-renders without a keypress and exits.
+`--hero-spp` and `--hero-span` trade that down. `p` at 720p costs about a ninth
+of 4K and `v` at VGA about a fortieth, which is the sane way to check the move
+before committing to it. `--autohero 4k|720p|vga` renders without a keypress
+and exits.
 
 ### Seeing the rays
 

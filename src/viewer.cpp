@@ -898,7 +898,7 @@ static void printControls() {
 "  - / =                exposure\n"
 "  b                    cycle scattering bounces (0-4)\n"
 "  g                    3D ray view: see the geodesics this camera casts\n"
-"  h / v                hero shot, 4K / VGA, streamed to kerr-hero-*.mp4\n"
+"  h / p / v            hero shot, 4K / 720p / VGA -> kerr-hero-*.mp4\n"
 "  r                    reset the camera\n"
 "  s                    save a PNG snapshot\n"
 "  q                    quit\n"
@@ -991,7 +991,7 @@ int main(int argc, char** argv) {
 "  --bounces N --sky-gain F --nostars\n"
 "  --exposure F --fps F --threads N --rtol F\n"
 "  --autorays             open the 3D ray view at startup\n"
-"  --autohero 4k|vga      render the hero shot and exit\n"
+"  --autohero 4k|720p|vga render the hero shot and exit\n"
 "  --hero-seconds F --hero-spp N --hero-span M\n"
 "  --video F --no-video --crf N    bake output; .mp4/.mkv encode H.265\n");
             printControls();
@@ -1288,8 +1288,9 @@ int main(int argc, char** argv) {
         // Scripted hero shot, so it can be rendered without a hand on the keyboard.
         if (!autoHero.empty() && mode == Mode::Live && !hero.active
             && since(startTime) > 0.4) {
-            if (autoHero == "4k") heroStart(3840, 2160, "4k");
-            else                  heroStart(640, 480, "vga");
+            if      (autoHero == "4k")   heroStart(3840, 2160, "4k");
+            else if (autoHero == "720p") heroStart(1280, 720,  "720p");
+            else                         heroStart(640,  480,  "vga");
             autoHero.clear();
         }
 
@@ -1482,8 +1483,9 @@ int main(int argc, char** argv) {
                     }
                     break;
                 case SDLK_r: camWanted = home; camChanged = true; break;
-                case SDLK_h: heroStart(3840, 2160, "4k");  break;
-                case SDLK_v: heroStart(640,  480,  "vga"); break;
+                case SDLK_h: heroStart(3840, 2160, "4k");   break;
+                case SDLK_p: heroStart(1280, 720,  "720p"); break;
+                case SDLK_v: heroStart(640,  480,  "vga");  break;
                 case SDLK_g:
                     if (mode == Mode::Live) {
                         // Capture with the workers parked: the scene is only
