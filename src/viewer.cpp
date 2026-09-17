@@ -871,6 +871,13 @@ struct Hero {
     bool   videoOpen = false;
     double lockedExposure = 0;
 
+    // Samples actually taken on the frame just finished.  Not the same thing as
+    // the dispatch counter: a retired tile still has work items handed to it,
+    // which it drops, so that counter always walks to the ceiling and reports
+    // "cap" however much the adaptive stop actually saved.
+    double lastMean = 0, lastCapped = 0, sumMean = 0;
+    uint32_t lastMin = 0, lastMax = 0;
+
     // what to put back afterwards
     int          saveW = 0, saveH = 0, saveScale = 1;
     CameraParams saveCam;
@@ -1224,6 +1231,11 @@ int main(int argc, char** argv) {
         });
         std::printf("\n  hero: %s -- %d frames to %s (%.0f s)\n",
                     why, hero.idx, hero.path.c_str(), since(hero.began));
+        if (hero.idx > 0 && hero.sumMean > 0)
+            std::printf("        %.0f samples per pixel on average, against a %d ceiling"
+                        "  (%.2fx the work of a flat ceiling)\n",
+                        hero.sumMean / hero.idx, hero.spp,
+                        hero.sumMean / hero.idx / double(hero.spp));
         std::fflush(stdout);
         hero.active = false;
         mode = Mode::Live;
@@ -1347,6 +1359,22 @@ int main(int argc, char** argv) {
                 // while they paint it would tear.
                 reconfigure(S, [&] {
                     if (hero.videoOpen) hero.vw.addFrame(S.display.data());
+                    {   // read the sample counts before they are cleared
+                        const size_t n = size_t(S.rt.rw) * size_t(S.rt.rh);
+                        uint64_t tot = 0; uint32_t lo = 0xffffffffu, hi = 0, atCap = 0;
+                        for (size_t i = 0; i < n; ++i) {
+                            uint32_t c = S.count[i];
+                            tot += c;
+                            if (c < lo) lo = c;
+                            if (c > hi) hi = c;
+                            if (c >= uint32_t(hero.spp)) ++atCap;
+                        }
+                        hero.lastMin  = (n ? lo : 0);
+                        hero.lastMax  = hi;
+                        hero.lastMean = n ? double(tot) / double(n) : 0.0;
+                        hero.lastCapped = n ? 100.0 * double(atCap) / double(n) : 0.0;
+                        hero.sumMean += hero.lastMean;
+                    }
                     ++hero.idx;
                     if (hero.idx >= hero.frames) { finished = true; return; }
                     double u   = double(hero.idx) / double(std::max(1, hero.frames - 1));
@@ -1361,9 +1389,11 @@ int main(int argc, char** argv) {
                 if (hero.idx % 10 == 0 || finished) {
                     double el = since(hero.began);
                     double eta = hero.idx > 0 ? el / hero.idx * (hero.frames - hero.idx) : 0;
-                    std::printf("\r  hero  %d/%d   %.0f%%   %u spp%s   %.0f s elapsed, %.0f s left    ",
+                    std::printf("\r  hero  %d/%d  %.0f%%   spp %u/%.0f/%u  %.0f%% at cap"
+                                "   %.0f s elapsed, %.0f s left    ",
                                 hero.idx, hero.frames, 100.0 * hero.idx / hero.frames,
-                                S.minCount.load(), allQuiet ? " quiet" : " cap", el, eta);
+                                hero.lastMin, hero.lastMean, hero.lastMax,
+                                hero.lastCapped, el, eta);
                     std::fflush(stdout);
                 }
                 if (finished) heroFinish("done");
