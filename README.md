@@ -1075,10 +1075,20 @@ unrelated.
 | **8 lanes** | **11.41** | 78 | **3.9×** |
 
 Per-step throughput went from 179 to 1078 Msteps/s — **6.0×**, against a
-theoretical ceiling of 8. The gap is lane divergence: a packet runs until *every*
-lane has terminated, so it does `max` steps rather than each ray's own, which is
-the 60 → 78 steps/ray column. Eight lanes still wins despite carrying the most
-waste, so the extra width more than pays for the divergence.
+theoretical ceiling of 8. It is tempting to read the 60 → 78 steps/ray column as
+the explanation, and an earlier version of this file did. That is wrong, and the
+error is worth naming: `Msteps/s` counts *issued* lane-steps, idle lanes
+included, so divergence cannot be what holds that figure below 8. Divergence is
+charged separately — it is what turns the 6.0× per-step number into the 3.9×
+per-ray one.
+
+What holds the per-step figure down is the packet code itself: it is heavier per
+lane than the scalar tracer it replaces, and at eight lanes its own working set
+has begun to spill. A packet runs until *every* lane has terminated, so it does
+still do `max` steps rather than each ray's own, and eight lanes wins despite
+carrying that waste. But the waste is the smaller half of the story.
+[Where the width actually goes](#where-the-width-actually-goes) takes the whole
+curve apart.
 
 Coherence is free here. A packet is eight samples of the **same pixel**,
 differing only by sub-pixel jitter and wavelength — and wavelength does not enter
@@ -1124,10 +1134,13 @@ Eight was the default at every width. Measuring it again, on this machine at
 | AVX2 | — | 9.33 | **10.29** |
 | SSE2 | **3.56** | 3.33 | 2.87 |
 
-Wider wins by more than the divergence argument allows for, because the extra
-independent work hides latency that idle lanes would otherwise expose. Note
-also that AVX2 at sixteen lanes (10.29) all but catches AVX-512 (11.10) — the
-width of the register continues to matter much less than having the rays.
+Wider wins by more than the divergence argument allows for, but not for the
+reason that suggests: sixteen lanes is no longer *width* at all, since a
+512-bit register already holds eight doubles. It is two registers per value, and
+what it buys is a better-scheduled instruction stream — worth about 20%, and
+the last such gain on offer, as the next section shows. Note also that AVX2 at
+sixteen lanes (10.29) all but catches AVX-512 (11.10) — the width of the
+register continues to matter much less than having the rays.
 
 The lane count never changes what is computed, only how it is grouped: a
 sample's ray depends on its index alone, so every width renders the same image
@@ -1139,6 +1152,143 @@ coherence — and gains 4 to 10% from sixteen. `viewer.cpp` packs one from
 **adjacent pixels**, which are different rays that diverge, and *loses* 2 to 6%:
 9.95 against 9.30 Mrays/s at 800×500. So the width is chosen where the packing
 is chosen, and the viewer keeps eight.
+
+### Where the width actually goes
+
+The tables above say what each width is worth. This one says why the curve
+bends, because the obvious answer — divergence — turns out to be the smallest of
+the three reasons.
+
+Measurements below are a single pinned core at 320×180, 32 spp, so the absolute
+rates are small and the ratios are clean. The baseline is `--no-simd`, the
+genuinely scalar tracer, not a one-lane packet build; both are shown because
+they are not the same thing.
+
+| lanes | Mrays/s | steps/ray | Mlane-step/s | per step | per ray |
+|---|--:|--:|--:|--:|--:|
+| `--no-simd` | 0.12 | 64 | 7.9 | 1.0× | 1.0× |
+| 1 | 0.11 | 65 | 6.9 | 0.9× | 0.9× |
+| 2 | 0.23 | 71 | 16.3 | 2.1× | 1.9× |
+| 4 | 0.37 | 77 | 28.9 | 3.7× | 3.1× |
+| 8 | 0.57 | 84 | 47.5 | 6.0× | 4.8× |
+| **16** | **0.67** | 89 | **59.1** | **7.5×** | **5.6×** |
+| 24 | 0.31 | 131 | 41.0 | 5.2× | 2.6× |
+| 32 | 0.64 | 93 | 59.2 | 7.5× | 5.3× |
+
+Note first that one lane is *slower* than `--no-simd`. That 13% is the price of
+the packet machinery itself — masked arithmetic, no early exit, both branches of
+every decision evaluated. It is charged before a single extra lane is filled.
+
+The machine this ran on: 5.42 GHz under load, and **11.0 G-FMA/s at 512 bits =
+2.03 FMA per cycle = 176 GFLOP/s per core**, which is two full-width FMA pipes.
+Those were measured, not read off a spec sheet.
+
+#### The register is full at eight doubles
+
+This is the dominant effect and it is almost embarrassingly simple. `vd` is a
+`vector_size` type, so the compiler maps it onto whatever registers it takes:
+
+| lanes | `sizeof(vd)` | register | insns per DP trial | insns per lane-step | cycles per lane-step |
+|---|--:|:--|--:|--:|--:|
+| 1 | 8 B | scalar `sd` | 810 | 810 | 474.8 |
+| 2 | 16 B | `xmm` | 882 | 441 | 190.2 |
+| 4 | 32 B | `ymm` | 832 | 208 | 97.6 |
+| 8 | 64 B | `zmm` | 827 | 103.4 | 50.5 |
+| 16 | 128 B | 2 × `zmm` | 1586 | 99.1 | 41.9 |
+| 32 | 256 B | 4 × `zmm` | 2899 | 90.6 | 42.0 |
+
+Up to eight lanes, `PacketDP::trial` compiles to *the same instruction stream* —
+827 to 882 instructions, whatever the width. Only the register changes. Each
+doubling is therefore free, and instructions per lane-step halve: 810, 441, 208,
+103. Cycles per lane-step follow: 474.8, 190.2, 97.6, 50.5.
+
+At sixteen lanes a `vd` no longer fits in a register, so every `vd` operation
+becomes two `zmm` operations and the instruction count nearly doubles, 827 →
+1586. At thirty-two it quadruples. Instructions per lane-step stops falling —
+103, 99, 91 — and so does the thing that matters, cycles per lane-step: **50.5,
+41.9, 42.0**. That flat tail is the whole non-linearity. There is no wider
+register to move up to, so the last two doublings cost what they deliver.
+
+#### Past eight, there is nothing left to feed the core
+
+The residual 20% that sixteen lanes does collect looks like better instruction
+scheduling, so the obvious question is whether feeding the core more independent
+work would collect more. It would not. Running K *independent* Dormand–Prince
+trials interleaved in one loop:
+
+| lanes | K=1 → K=3 |
+|---|--:|
+| 2 | **+15%** |
+| 4 | +4% |
+| 8 | +3.5% |
+| 16 | 0% |
+| 32 | −3% |
+
+At two lanes the kernel is latency-bound and extra work plainly helps. By eight
+it barely does; at sixteen and beyond it does nothing. Both routes to more
+parallelism — wider vectors and more packets — run into the same 32-register
+budget, and both stop paying at the same place. It is the register file that
+caps this kernel, not the FMA pipes: at sixteen lanes the trial issues 658
+FMA+MUL in 672 cycles, **49% of the two pipes**, with the other half spent
+elsewhere.
+
+#### At thirty-two, register pressure takes the gain back
+
+| lanes | `zmm` used by the RHS | spill ld/st in `trial` | `runPacket` stack frame |
+|---|--:|--:|--:|
+| 8 | 14 of 32 | 2 / 2 | 8 KB |
+| 16 | 28 of 32 | 60 / 38 | 21.5 KB |
+| 32 | **32 of 32** | 217 / 179 | **44.8 KB** |
+
+The L1 data cache is 48 KB. At thirty-two lanes the stack frame of one
+`runPacket` call very nearly fills it, and the instruction mix shows where the
+cycles go: at eight lanes 199 of the 800 instructions in `runPacket` are data
+movement; at thirty-two it is **1299 of 2789 — 47% of the hot loop is moving
+registers to and from the stack.** That is what cancels the extra lanes exactly.
+
+#### Divergence is real, and it is the smallest of the three
+
+Occupancy here is the fraction of *issued* lane-steps that were on a live ray,
+counted directly rather than inferred:
+
+| lanes | primary rays only | with 2 bounces | segment occupancy |
+|---|--:|--:|--:|
+| 2 | 99.3% | 92.5% | 94.6% |
+| 4 | 97.9% | 84.4% | 89.1% |
+| 8 | 95.7% | 75.9% | 83.6% |
+| 16 | 91.4% | 68.9% | 80.4% |
+| 32 | 84.1% | 61.3% | 77.9% |
+
+Divergence *within* a packet of primary rays costs 4 to 9% at the widths anyone
+would ship — small, and exactly what the coherence argument predicts. The much
+larger loss appears only once the disk is scattering, and it is not really
+divergence at all: it is **segment restart**. When a lane scatters off the disk,
+`tracePacket` re-enters `runPacket` with just the survivors, 1.48 to 1.59 times
+per packet, and those later segments run partly empty. That is the 83.6% → 77.9%
+column, and it is the one worth attacking.
+
+The two factors compose, and the first table is enough to check it: per-step
+speedup × occupancy should give per-ray speedup, where occupancy is the
+`--no-simd` steps/ray over this width's. At eight lanes, 6.0 × (64/84) = 4.6
+against 4.8 measured; at sixteen, 7.5 × (64/89) = 5.4 against 5.6. The few
+percent is the integer rounding on the steps/ray column.
+
+#### Twenty-four lanes is the price list, made visible
+
+`sizeof(vd)` for 24 lanes rounds up to **256 bytes — four `zmm` registers,
+exactly what 32 lanes costs** — to carry three quarters of the work. It measures
+0.31 Mrays/s against 32's 0.64. It is not a point on the curve so much as a
+demonstration of how the curve is priced, which is why the ISA table above only
+offers powers of two.
+
+#### Two things this rules out
+
+- **The FMA ports are not the wall.** 49% occupied at the best width. Chasing
+  flops here would be chasing the wrong half.
+- **Software reciprocals do not help.** There are 26 `vdivpd` per trial and the
+  divider is slow, so replacing them with `rcp14` plus two Newton steps is the
+  standard move. Measured on this core it is **3.89 cycles against the hardware
+  divide's 3.84** — no faster, and it would move the work onto the busier pipes.
 
 ### Threads
 
