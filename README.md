@@ -159,6 +159,34 @@ Frames are streamed to the encoder as they converge rather than kept. That is
 not an optimisation: a minute of 4K is 1440 frames of 24 MB, and holding them
 the way a bake does would want 35 GB. One frame is in memory at a time.
 
+Frames are sampled adaptively, the same way `./kerr` samples a still: each pixel
+tracks the variance of its own luminance estimates and stops once the standard
+error, pushed through the tone curve, falls under `--hero-noise` (1 LSB by
+default). `--hero-spp` is the ceiling rather than the count. This matters more
+here than for a still, because the move starts on a frame that is mostly empty
+sky and ends on one that is almost all disk — a flat count is the wrong shape
+for both ends.
+
+Six frames at 720p, measured:
+
+| | time |
+|---|--:|
+| flat `--hero-spp 512` | 275 s |
+| `--hero-noise 1`, same 512 ceiling | **77 s** |
+
+**3.6×**, for the same ceiling and the same target. Note that adaptive is not
+free speed: against a flat 96 spp it is *slower* — 77 s against 55 s — because
+it is reaching a quality the flat render never gets to. What it buys is a
+quality you name, at the cost that quality actually requires.
+
+Two details the viewer forced that the CLI did not. The test costs two
+tone-curve evaluations per pixel, and run after every pass it spends more than
+the skipping saves — measured *slower* than not doing it at all — so it runs
+every sixteenth pass instead. And the tracer works on packets of eight adjacent
+pixels, so eight is the finest grain it can skip at; retiring whole tiles alone
+was far too blunt, since one stubborn pixel on the disk edge keeps its 256
+neighbours tracing.
+
 **It is a long render.** 4K at 96 spp is about two minutes a frame on 32 cores,
 so a minute of footage is the better part of two days; the estimate is printed
 before the first frame so `ESC` can end it cheaply. `--hero-seconds`,

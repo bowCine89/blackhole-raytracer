@@ -92,6 +92,16 @@ struct Shared {
     Target       rt;
 
     std::vector<double>   accum;    // rw*rh*3, CIE XYZ
+    // Adaptive sampling, used by the hero shot.  sumY2 is what a per-pixel
+    // variance is built from; without it there is no way to ask how noisy a
+    // pixel still is.  Live viewing leaves this off and refines forever.
+    std::vector<double>   sumY2;    // rw*rh, sum of squared sample luminance
+    std::vector<uint8_t>  pixDone;  // rw*rh, 1 once that pixel is quiet enough
+    bool                  adaptive = false;
+    double                noiseTarget = 1.0;   // output LSB
+    int                   minSppPix = 16;
+    std::unique_ptr<std::atomic<uint8_t>[]> tileDone;
+    std::atomic<int>      tilesDone{0};
     std::vector<uint32_t> count;    // rw*rh
     std::vector<uint8_t>  display;  // winW*winH*3, what workers paint into
     std::vector<uint8_t>  present;  // last *complete* pass, shown while moving
@@ -148,11 +158,16 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
     // Deposit one finished sample and repaint the block it stands for.
     auto shade = [&](size_t idx, int x, int y, const Real* lam, const Real* L) {
         double* a = &S.accum[idx * 3];
+        double  ys = 0;
         for (int k = 0; k < spec::NLAMBDA; ++k) {
             if (L[k] <= 0) continue;
             Vec3 c = spec::cieXYZ(lam[k]);
             a[0] += c.x * L[k]; a[1] += c.y * L[k]; a[2] += c.z * L[k];
+            ys += c.y * L[k];
         }
+        // This sample's own luminance, squared: the variance needs the sum of
+        // squares, and this is the only place the per-sample value exists.
+        if (!S.sumY2.empty()) S.sumY2[idx] += ys * ys;
         uint32_t n = ++S.count[idx];
 
         // Tone map this pixel now, while its data is hot in cache.
@@ -180,6 +195,17 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
     for (int y = ty; y < y1; ++y) {
         for (int x = tx; x < x1; x += LANES) {
             const int n = std::min(LANES, x1 - x);
+
+            // Stopping per tile alone is too blunt: one stubborn pixel on the
+            // disk edge would keep its 256 neighbours tracing.  A packet of
+            // eight is the finest grain the SIMD tracer can skip at, and it
+            // recovers most of what per-pixel stopping would give.
+            if (!S.pixDone.empty()) {
+                bool allDone = true;
+                for (int j = 0; j < n && allDone; ++j)
+                    allDone = S.pixDone[size_t(y) * rt.rw + x + j] != 0;
+                if (allDone) continue;
+            }
 
             Geodesic gp[LANES];
             Real     lam[LANES][spec::NLAMBDA];
@@ -221,6 +247,45 @@ static void renderTile(Shared& S, int tile, uint64_t sampleIdx) {
             for (int j = 0; j < n; ++j) shade(idxs[j], x + j, y, lam[j], rad[j]);
         }
     }
+
+    // Is this tile quiet enough to stop?  The standard error of each pixel's
+    // mean goes through the same tone curve the frame will get, so the test is
+    // in the units the result is judged in: one LSB means the remaining noise
+    // moves that pixel by less than a step in 255.  A tile retires only when
+    // every pixel in it passes, which keeps the decision at the granularity the
+    // dispatcher works in.
+    // Only every sixteenth pass.  The test costs two tone-curve evaluations per
+    // pixel, and run after every pass it spends more than the skipping saves --
+    // measured slower than not doing it at all.  Amortised like this the
+    // overhead disappears and a pixel overshoots its target by at most fifteen
+    // samples, which is noise well below the target anyway.
+    if (S.adaptive && !S.sumY2.empty()
+        && sampleIdx >= uint64_t(S.minSppPix) && (sampleIdx % 16) == 15) {
+        const double kY = double(sc.lamScale) / spec::NLAMBDA;
+        bool quiet = true;
+        for (int y = ty; y < y1; ++y)
+            for (int x = tx; x < x1; ++x) {
+                const size_t idx = size_t(y) * rt.rw + x;
+                if (S.pixDone[idx]) continue;
+                const uint32_t n = S.count[idx];
+                bool ok = false;
+                if (n >= uint32_t(S.minSppPix)) {
+                    const double sY = S.accum[idx * 3 + 1];
+                    const double mean = sY / n;
+                    double var = (S.sumY2[idx] - sY * mean) / double(n - 1);
+                    if (var < 0) var = 0;
+                    const double se = std::sqrt(var / n) * kY;
+                    const double m  = mean * kY;
+                    const double a0 = spec::srgbEncode(spec::acesFilmic(std::max(0.0, expScale * m)));
+                    const double a1 = spec::srgbEncode(spec::acesFilmic(std::max(0.0, expScale * (m + se))));
+                    ok = 255.0 * std::fabs(a1 - a0) <= S.noiseTarget;
+                }
+                if (ok) S.pixDone[idx] = 1; else quiet = false;
+            }
+        if (quiet && S.tileDone[tile].exchange(1, std::memory_order_relaxed) == 0)
+            S.tilesDone.fetch_add(1, std::memory_order_relaxed);
+    }
+
     S.samplesTraced.fetch_add(traced, std::memory_order_relaxed);
 }
 
@@ -255,7 +320,9 @@ static void workerLoop(Shared& S) {
         // inside this tile, drop the work item rather than race it; the only
         // consequence is that this tile skips one sample index, which the
         // per-pixel sample count already accounts for.
-        if (S.tileBusy[tile].exchange(1, std::memory_order_acquire) == 0) {
+        if (S.tileDone && S.tileDone[tile].load(std::memory_order_relaxed)) {
+            // Retired: quiet enough, and no longer worth a ray.
+        } else if (S.tileBusy[tile].exchange(1, std::memory_order_acquire) == 0) {
             renderTile(S, tile, samp);
             S.tileBusy[tile].store(0, std::memory_order_release);
         }
@@ -311,6 +378,16 @@ static void resetAccumulation(Shared& S) {
 
     S.accum.assign(size_t(rt.rw) * rt.rh * 3, 0.0);
     S.count.assign(size_t(rt.rw) * rt.rh, 0u);
+    if (S.adaptive) {
+        S.sumY2.assign(size_t(rt.rw) * rt.rh, 0.0);
+        S.pixDone.assign(size_t(rt.rw) * rt.rh, uint8_t(0));
+    } else {
+        S.sumY2.clear();
+        S.pixDone.clear();
+    }
+    S.tileDone = std::make_unique<std::atomic<uint8_t>[]>(size_t(S.numTiles));
+    for (int i = 0; i < S.numTiles; ++i) S.tileDone[i].store(0, std::memory_order_relaxed);
+    S.tilesDone.store(0, std::memory_order_relaxed);
     S.work.store(0, std::memory_order_relaxed);
 }
 
@@ -930,8 +1007,9 @@ int main(int argc, char** argv) {
     std::string videoOut = "kerrbake.avi";   // .mp4 or .mkv here encodes H.265
     int    bakeCrf = 18;
     double heroSeconds = 60.0;   // H and V render this much footage
-    int    heroSpp = 96;         // convergence per hero frame
+    int    heroSpp = 512;        // ceiling; --hero-noise decides when to stop short
     Real   heroSpan = 48.0;      // coordinate time the move covers, ~2 ISCO orbits
+    double heroNoise = 1.0;      // target output noise per hero frame, in LSB
     double autoQuit = 0.0;      // scripted run: render for N seconds, snapshot, exit
     bool   autoOrbit = false;   // scripted camera motion, to exercise the moving path
     bool   autoRays  = false;   // scripted: open the ray view straight away
@@ -974,6 +1052,7 @@ int main(int argc, char** argv) {
         else if (a == "--hero-seconds") heroSeconds = nextF();
         else if (a == "--hero-spp")     heroSpp = nextI();
         else if (a == "--hero-span")    heroSpan = nextF();
+        else if (a == "--hero-noise")   heroNoise = nextF();
         else if (a == "--autobake")   autoBake = nextI();
         else if (a == "--threads")    threads = nextI();
         else if (a == "--autoquit")   autoQuit = nextF();
@@ -992,7 +1071,7 @@ int main(int argc, char** argv) {
 "  --exposure F --fps F --threads N --rtol F\n"
 "  --autorays             open the 3D ray view at startup\n"
 "  --autohero 4k|720p|vga render the hero shot and exit\n"
-"  --hero-seconds F --hero-spp N --hero-span M\n"
+"  --hero-seconds F --hero-spp N --hero-span M --hero-noise LSB\n"
 "  --video F --no-video --crf N    bake output; .mp4/.mkv encode H.265\n");
             printControls();
             return 0;
@@ -1128,6 +1207,7 @@ int main(int argc, char** argv) {
             hero.videoOpen = false;
         }
         reconfigure(S, [&] {
+            S.adaptive = false;            // live viewing refines indefinitely
             S.rt.winW = hero.saveW; S.rt.winH = hero.saveH; S.rt.scale = hero.saveScale;
             S.display.assign(size_t(hero.saveW) * hero.saveH * 3, 0u);
             S.present = S.display;
@@ -1183,10 +1263,10 @@ int main(int argc, char** argv) {
 
         double rays = double(hw) * hh * hero.spp * hero.frames;
         double est  = rays / std::max(1.0e5, raysPerSec);
-        std::printf("\n  hero: %dx%d, %d frames at %.0f fps (%.0f s of footage), %d spp\n"
-                    "        %.1f Gray total, about %.1f h at the current rate -- ESC to abandon\n",
+        std::printf("\n  hero: %dx%d, %d frames at %.0f fps (%.0f s of footage), %d spp ceiling\n"
+                    "        adaptive to %.2f LSB; at most %.1f Gray, under %.1f h -- ESC to abandon\n",
                     hw, hh, hero.frames, hero.fps, hero.frames / hero.fps, hero.spp,
-                    rays / 1e9, est / 3600.0);
+                    heroNoise, rays / 1e9, est / 3600.0);
         std::fflush(stdout);
 
         camWanted = heroPose(home, 0.0);
@@ -1200,6 +1280,9 @@ int main(int argc, char** argv) {
             S.tObs       = tWanted;
             S.scene.disk.loopPeriod = 0;   // no loop trick: the disk simply turns
             S.passLimit.store(0, std::memory_order_relaxed);   // converge, uncapped
+            S.adaptive    = heroNoise > 0; // 0 falls back to a flat --hero-spp
+            S.noiseTarget = heroNoise;
+            S.minSppPix   = 16;
             resetAccumulation(S);
         });
         hero.active = true;
@@ -1257,7 +1340,8 @@ int main(int argc, char** argv) {
             // way in, and a level metered from the wide shot burns the close-up
             // to white.  The viewer's metering is already smoothed over time,
             // which is what keeps the adjustment from showing.
-            if (S.minCount.load(std::memory_order_relaxed) >= uint32_t(hero.spp)) {
+            bool allQuiet = S.tilesDone.load(std::memory_order_relaxed) >= S.numTiles;
+            if (allQuiet || S.minCount.load(std::memory_order_relaxed) >= uint32_t(hero.spp)) {
                 bool finished = false;
                 // The frame is taken with the workers parked; reading display
                 // while they paint it would tear.
@@ -1277,8 +1361,9 @@ int main(int argc, char** argv) {
                 if (hero.idx % 10 == 0 || finished) {
                     double el = since(hero.began);
                     double eta = hero.idx > 0 ? el / hero.idx * (hero.frames - hero.idx) : 0;
-                    std::printf("\r  hero  %d/%d   %.0f%%   %.0f s elapsed, %.0f s left    ",
-                                hero.idx, hero.frames, 100.0 * hero.idx / hero.frames, el, eta);
+                    std::printf("\r  hero  %d/%d   %.0f%%   %u spp%s   %.0f s elapsed, %.0f s left    ",
+                                hero.idx, hero.frames, 100.0 * hero.idx / hero.frames,
+                                S.minCount.load(), allQuiet ? " quiet" : " cap", el, eta);
                     std::fflush(stdout);
                 }
                 if (finished) heroFinish("done");
