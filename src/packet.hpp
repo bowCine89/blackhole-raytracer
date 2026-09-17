@@ -201,9 +201,14 @@ inline void runPacket(const Kerr& kerr, const Disk& disk, const Propagator& prop
     const vd rCutV = vsplat(disk.rCut);
     const vd zero  = vsplat(0.0);
 
+    // 0.15, not 0.30, and for the reason spelled out in render.hpp: the cap
+    // has to sit under the step size the error controller settles on, or the
+    // controller oscillates and half the far-field steps are thrown away.
+    // This must stay in step with the scalar capFor -- the packet-vs-scalar
+    // pair in --check is what notices if it does not.
     auto capFor = [&](const PacketState& s, const PacketState& k1) {
         vd c = vsplat(8.0);
-        c = vmin(c, vsplat(0.30) * vmax(s.y[0], vsplat(1.0)) / vmax(vabs(k1.y[0]), vsplat(1e-30)));
+        c = vmin(c, vsplat(0.15) * vmax(s.y[0], vsplat(1.0)) / vmax(vabs(k1.y[0]), vsplat(1e-30)));
         c = vmin(c, vsplat(0.25) / vmax(vabs(k1.y[1]), vsplat(1e-30)));
         c = vmin(c, vsplat(0.50) / vmax(vabs(k1.y[2]), vsplat(1e-30)));
         return c;

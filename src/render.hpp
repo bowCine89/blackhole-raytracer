@@ -42,12 +42,29 @@ struct Propagator {
         RayConst rc(kerr->a, g.E, g.L);
         geodesicRhs(rc, y, dp.k1);
 
-        // Step caps keep each step geometrically sane: no more than ~30% of
+        // Step caps keep each step geometrically sane: no more than ~15% of
         // the current radius, ~0.25 rad in theta, ~0.5 rad in phi.  Without
         // them a very accurate step could still leap across the whole disk.
+        //
+        // The radial coefficient is not a safety margin, it is the working
+        // step size, and it has to sit *below* what the error controller would
+        // choose or the two fight each other.  The controller is pure feedback:
+        // it sizes step n+1 from the error of step n, which assumes the local
+        // error coefficient has not moved.  In the far field it moves a lot,
+        // because dr/dlambda goes as r^2 and a step covers a fixed fraction of
+        // r, so the same h lands on a ~40% larger radius next time and the
+        // error jumps with the fifth power of that.  Left alone the controller
+        // overshoots, is rejected, backs off, and overshoots again: measured at
+        // 0.30 it produced *exactly* 50% rejected steps beyond r = 64 M, and
+        // 36.7% over a whole frame.  Putting the cap at 0.15 -- just under the
+        // 0.18 the controller settles on -- lets the geometry lead instead of
+        // trail, and the oscillation stops.  Rejections fall to 11.8%, steps
+        // per ray from 48.9 to 35.7, and because the steps that survive are
+        // better placed the error goes *down* as well, on every measure.  See
+        // the performance notes in the README.
         auto capFor = [&](const State& s, const State& k1) {
             Real c = 8.0;
-            c = std::min(c, 0.30 * std::max<Real>(s.y[0], 1.0) / std::max(std::fabs(k1.y[0]), 1e-30));
+            c = std::min(c, 0.15 * std::max<Real>(s.y[0], 1.0) / std::max(std::fabs(k1.y[0]), 1e-30));
             c = std::min(c, 0.25 / std::max(std::fabs(k1.y[1]), 1e-30));
             c = std::min(c, 0.50 / std::max(std::fabs(k1.y[2]), 1e-30));
             return c;

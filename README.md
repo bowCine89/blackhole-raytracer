@@ -1290,6 +1290,99 @@ offers powers of two.
   standard move. Measured on this core it is **3.89 cycles against the hardware
   divide's 3.84** — no faster, and it would move the work onto the busier pipes.
 
+### The step controller was fighting itself
+
+Every figure in this chapter up to here predates this section; the tracer is
+about 1.25× faster than they say.
+
+Dormand–Prince sizes step *n+1* from the error of step *n*. That is pure
+feedback, and it assumes the local error coefficient has not moved in between.
+In the far field it moves a great deal. $dr/d\lambda$ goes as $r^2$, a step
+covers a fixed fraction of $r$, so one step later the same $h$ lands on a ~40%
+larger radius — and the error is the fifth power of that. Watch one escaping
+ray, past $r = 64M$:
+
+```
+   n          r            h          err   verdict
+  29      64.05   2.6276e-03    5.608e-01   accept
+  30      64.05   2.6549e-03    1.545e+00   REJECT     h up 1.0%, err up 2.75x
+  31      75.92   2.1920e-03    5.625e-01   accept
+  32      75.92   2.2133e-03    1.523e+00   REJECT
+  33      90.03   1.8313e-03    5.639e-01   accept
+```
+
+The controller raises $h$ by one percent and the error nearly triples. It
+overshoots, is rejected, backs off, overshoots again — for ever. Beyond
+$r = 64M$ the rejection rate was **exactly 50%**: one wasted trial, seven
+right-hand sides each, for every step that counted. Over a whole frame, 36.7%
+of all steps were thrown away.
+
+The fix is not a better controller. It is that the geometric step cap — the one
+that stops a step leaping across the disk — was set at 30% of the current
+radius, while the error controller settles at about 18%. The cap therefore
+never bound (0.02% of steps), and the feedback loop was left to oscillate on
+its own. Moving the cap to **15%**, just under the controller's own operating
+point, makes geometry lead instead of trail:
+
+| | steps/ray | rejected | Mrays/s |
+|---|--:|--:|--:|
+| cap at 0.30 | 88 | 36.7% | 11.1 |
+| **cap at 0.15** | **62** | **11.8%** | **13.6** |
+
+**1.22× at 640×360, 1.29× at 1280×720**, and 1.39× on a small adaptive render,
+whose per-pixel sample counts come out bit-identical — the noise behaviour is
+untouched. Across six scenes (spin 0 to 0.998, $r_{\rm cam}$ 15 to 100 M,
+inclination 5° to 88°) the step saving is 24–28% wherever a useful fraction of
+rays reach the far field, and 3–5% for close-in or near face-on views where few
+do.
+
+The steps that remain are also *better placed*, so the image gets closer to the
+truth rather than further from it. Against an `--rtol 1e-9` reference at
+640×360, 64 spp:
+
+| | RMS relative error | samples off by >1% |
+|---|--:|--:|
+| cap at 0.30 | 4.32e-4 | 528 of 691200 |
+| **cap at 0.15** | **3.33e-4** | **404 of 691200** |
+
+Faster on every scene and more accurate on every measure, from one constant.
+`--check` passes unchanged, including the packet-versus-scalar pair.
+
+#### What the curvature actually says, and three things that did not work
+
+The obvious principled version is to cap on the curvature instead of on $r$.
+Kerr is vacuum, so the Ricci tensor vanishes and the curvature lives in
+
+$$\Psi_2 = \frac{-M}{(r - i a\cos\theta)^3}, \qquad
+  |\Psi_2| = \frac{M}{\Sigma^{3/2}}, \qquad \Sigma = r^2 + a^2\cos^2\theta,$$
+
+which gives a step cap that bounds the fractional change in the curvature the
+ray is moving through, $|d\Sigma/d\lambda| \, h \le \epsilon\,\Sigma$, with
+$d\Sigma/d\lambda$ free from the right-hand side already in hand. It was
+implemented and measured, and it is **indistinguishable from capping on $r$** —
+$\epsilon = 0.30$ reproduces the 0.15 radial cap to three digits on every
+metric. The reason is that $\Sigma$ is within a factor of 1.5 of $r^2$ anywhere
+outside the horizon, so $d\log\Sigma \approx 2\,d\log r$, and the $\theta$
+motion is already covered by the separate 0.25 rad cap. The curvature is
+genuinely what should set the step — it just happens that $r$ is a faithful
+proxy for it here, so the simpler code wins.
+
+Also tried and rejected:
+
+- **A PI controller** on the error, the textbook cure for accept/reject
+  oscillation. It damps oscillation around a *fixed* point; here the target is
+  a moving ramp. 54.5 steps/ray against the baseline's 48.9 — worse than doing
+  nothing.
+- **Feed-forward from FSAL**, scaling $h$ by how much $|\dot r|/r$ changed
+  across the step, which costs nothing because $k_7$ is already the next $k_1$.
+  It fights the feedback term instead of composing with it: 38.8 steps/ray and
+  worse error than the cap.
+- **A smaller escape radius.** Residual bending past $r$ falls exactly as $1/r$
+  — 2.8e-6 rad from $r = 2000M$, 5.5e-5 from 512, 2.2e-4 from 256 — against
+  6.7e-4 rad for one 1920-wide pixel. Dropping $r_{\rm escape}$ from 2000 to
+  512 is worth a further 1.12× and shifts stars by 0.08 pixel. That is a real
+  trade rather than a free win, so it is left alone.
+
 ### Threads
 
 | threads | time | Mrays/s |
